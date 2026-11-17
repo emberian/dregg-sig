@@ -146,3 +146,8 @@ def test_shake256_matches_the_keccak_vectors():
     k = KAT["keccak"]
     assert dregg_sig.shake256_32(b"") == h(k["shake256_empty_32"])
     assert dregg_sig.shake256_32(b"abc") == h(k["shake256_abc_32"])
+
+
+def test_the_built_extension_carries_the_stable_abi_name():
+    """build.sh names the file for the stable ABI, so a CPython other than the one that built it imports it too."""
+    assert os.path.basename(dregg_sig.__file__) == "dregg_sig.abi3.so", dregg_sig.__file__

@@ -15,6 +15,8 @@ mkdir -p "$OUT"
 
 CARGO_TARGET_DIR=target cargo build --release --manifest-path bindings/python/Cargo.toml --lib
 
-SUFFIX=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-cp target/release/libdregg_sig.so "$OUT/dregg_sig$SUFFIX"
-echo "built $OUT/dregg_sig$SUFFIX"
+# The crate is built against the stable ABI (pyo3 `abi3-py39`), so the file takes the stable-ABI name: every CPython
+# from 3.9 imports `dregg_sig.abi3.so`, while the interpreter-tagged name (`.cpython-314-...so`) loads only in the
+# interpreter that ran this script.
+cp target/release/libdregg_sig.so "$OUT/dregg_sig.abi3.so"
+echo "built $OUT/dregg_sig.abi3.so"
