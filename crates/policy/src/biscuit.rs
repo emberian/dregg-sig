@@ -211,6 +211,14 @@ pub fn capability_request_digest(r: &CapabilityRequest) -> [u8; 32] {
     )
 }
 
+/// The identifier [`PqBiscuitAuthorityKey::mint_once`] consumes for `token_id`.
+pub fn mint_once_id(authority_pk: &PqBiscuitAuthorityPublicKey, token_id: &[u8; 32]) -> [u8; 32] {
+    cshake256_framed_32(
+        b"QSAG.BISCUIT.MINT.ONCE.V1",
+        &[&authority_pk.to_bytes(), token_id],
+    )
+}
+
 fn hop_signing_message(
     prev_chain_digest: &[u8; 32],
     token_id: &[u8; 32],
@@ -545,6 +553,49 @@ impl PqBiscuitAuthorityKey {
             seal: None,
         };
         Ok((token, step1))
+    }
+
+    /// [`Self::mint`], at most once per `token_id` under this authority.
+    ///
+    /// `issued` is the authority's one issuance domain: before anything is signed it
+    /// consumes `mint_once_id(authority_pk, token_id)`, so a second call with the same
+    /// `token_id` returns [`CapabilityError::Replay`] and signs nothing. Use it when
+    /// `token_id` names an outside event that may be turned into one grant only (an
+    /// order, a payment). Consumption comes first, so a crash or a failure after it
+    /// burns the id without issuing a token; it is never refunded. The domain has the
+    /// same deployment rules as a seal store: one per authority, durable, and
+    /// anchored if a restored file must not re-admit an id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_once<B: AcceleratorBackend>(
+        &mut self,
+        dp: &FrontierDpTable,
+        token_id: [u8; 32],
+        audience: [u8; 32],
+        caveats: &[Caveat],
+        mut next_step_entropy: [u8; 32],
+        hedging_nonce: &[u8; 32],
+        accel: &B,
+        issued: &mut dyn SealConsumptionDomain,
+    ) -> Result<(PqBiscuit, PqBiscuitStepKey), CapabilityError> {
+        let entropy = SecretBuffer(&mut next_step_entropy);
+        // Refusals mint would make anyway must not burn the id.
+        if dp.params != FrontierFtsProfile::Compact1122.params() {
+            return Err(CapabilityError::Denied);
+        }
+        if self.remaining_mints() == 0 {
+            return Err(CapabilityError::Denied);
+        }
+        encode_first_party_caveats(caveats)?;
+        issued.consume(mint_once_id(&self.pk, &token_id))?;
+        self.mint(
+            dp,
+            token_id,
+            audience,
+            caveats,
+            **entropy,
+            hedging_nonce,
+            accel,
+        )
     }
 
     /// Secret snapshot for encrypted, rollback-protected custody. Its trailing
@@ -1337,6 +1388,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mint_once_refuses_a_second_token_for_the_same_id() {
+        let accel = CpuReferenceBackend::new();
+        let dp = FrontierDpTable::build(FrontierFtsProfile::Compact1122);
+        let mut authority =
+            PqBiscuitAuthorityKey::keygen([0x11; 32], [0xAA; 32], 3, &accel).unwrap();
+        let pk = *authority.public_key();
+        let req = sample_request();
+        let mut issued = MemorySealConsumptionStore::new(16);
+
+        // Plain mint signs two tokens for one id; that is what mint_once is for.
+        let (a, _) = authority
+            .mint(
+                &dp,
+                [0x44; 32],
+                req.audience,
+                &[],
+                [0x51; 32],
+                &[0x61; 32],
+                &accel,
+            )
+            .unwrap();
+        let (b, _) = authority
+            .mint(
+                &dp,
+                [0x44; 32],
+                req.audience,
+                &[],
+                [0x52; 32],
+                &[0x62; 32],
+                &accel,
+            )
+            .unwrap();
+        assert_eq!(a.token_id(), b.token_id());
+        assert_ne!(a.authority_leaf_index(), b.authority_leaf_index());
+
+        let (token, step) = authority
+            .mint_once(
+                &dp,
+                [0x45; 32],
+                req.audience,
+                &[Caveat::Resource(req.resource)],
+                [0x53; 32],
+                &[0x63; 32],
+                &accel,
+                &mut issued,
+            )
+            .unwrap();
+        let leaf_after_first = authority.next_leaf();
+        assert_eq!(
+            authority
+                .mint_once(
+                    &dp,
+                    [0x45; 32],
+                    req.audience,
+                    &[],
+                    [0x54; 32],
+                    &[0x64; 32],
+                    &accel,
+                    &mut issued,
+                )
+                .map(|_| ()),
+            Err(CapabilityError::Replay),
+            "a second token was minted for one id"
+        );
+        assert_eq!(
+            authority.next_leaf(),
+            leaf_after_first,
+            "a refused mint spent a leaf"
+        );
+
+        // A refusal mint would make anyway leaves the id unburnt.
+        let too_many = vec![Caveat::Actions(1); MAX_CAVEATS + 1];
+        assert_eq!(
+            authority
+                .mint_once(
+                    &dp,
+                    [0x46; 32],
+                    req.audience,
+                    &too_many,
+                    [0x55; 32],
+                    &[0x65; 32],
+                    &accel,
+                    &mut issued,
+                )
+                .map(|_| ()),
+            Err(CapabilityError::TooManyCaveats)
+        );
+        authority
+            .mint_once(
+                &dp,
+                [0x46; 32],
+                req.audience,
+                &[],
+                [0x56; 32],
+                &[0x66; 32],
+                &accel,
+                &mut issued,
+            )
+            .unwrap();
+
+        // An issuance domain that cannot record refuses before signing.
+        let before = authority.next_leaf();
+        assert_eq!(
+            authority
+                .mint_once(
+                    &dp,
+                    [0x47; 32],
+                    req.audience,
+                    &[],
+                    [0x57; 32],
+                    &[0x67; 32],
+                    &accel,
+                    &mut MemorySealConsumptionStore::new(0),
+                )
+                .map(|_| ()),
+            Err(CapabilityError::ConsumptionFailed)
+        );
+        assert_eq!(authority.next_leaf(), before);
+
+        // The token it did mint verifies as any other.
+        let sealed = step.seal(&token, &dp, None, &[0x68; 32], &accel).unwrap();
+        sealed
+            .verify(&pk, &dp, &req, &mut MemorySealConsumptionStore::new(16))
+            .unwrap();
     }
 
     #[test]

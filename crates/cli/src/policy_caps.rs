@@ -40,6 +40,7 @@ const BISCUIT_STEP_SK_FORMAT: &str = "qsag-biscuit-step-secret-v1";
 const BISCUIT_TOKEN_FORMAT: &str = "qsag-biscuit-token-v2";
 const BISCUIT_ANCHOR_DOMAIN: &str = "biscuit_authority";
 const SEAL_STORE_ANCHOR_DOMAIN: &str = "biscuit_seal_store";
+const MINT_STORE_ANCHOR_DOMAIN: &str = "biscuit_mint_store";
 
 const MACAROON_HELP: &str = "\
 dregg-sig policy macaroon <keygen|issue|attenuate|issue-discharge|bind-discharge|verify> [options]
@@ -79,6 +80,7 @@ Post-quantum public-key capability chains over one-time Compact1122 (FrontierSum
              --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM.
   mint       --secret <sk.json> --audience-hex <64-hex> [--token-id-hex <64-hex>]
              --token-out <biscuit.json> --step-key-out <step1.sk> [caveats] [anchor options]
+             [--mint-store <ledger> [--create-mint-store]]
   attenuate  --in <biscuit.json> --step-key <step.sk> --token-out <next.json>
              --step-key-out <next.sk> [caveats]
   seal       --in <biscuit.json> --step-key <step.sk> --out <sealed.json>
@@ -101,6 +103,12 @@ it is not: restoring the file re-admits every seal consumed since. The anchor ke
 <ledger>.anchor-key (owner-only); someone who can read it and rewrite the anchor can forge.
 Replicas: two verifiers with separate stores each accept a seal once. Nothing local can
 detect that; run one store per audience, or put one linearizable service behind it.
+
+One token per id: with --mint-store, mint consumes the --token-id-hex in the authority's
+issuance store before it signs, and refuses an id it has already consumed. Use it when the
+id names something outside that may become one grant only (an order, a payment). The store
+follows the seal store's rules: one per authority, created once, anchored with --anchor-dir
+if a restored file must not re-admit an id. An id is burnt even if the mint fails after it.
 
 Step keys (--step-key-out) are one-time bearer secrets. `attenuate` and `seal` retire the
 file before signing, so a second use on this host is refused, as is putting back the key file
@@ -781,10 +789,11 @@ fn biscuit_mint(raw: &[String]) -> Result<(), CliError> {
         "step-key-out",
         "passphrase-env",
         "passphrase-file",
+        "mint-store",
     ];
     opts.extend_from_slice(&CAVEAT_OPTIONS[..5]); // first-party caveats only
     opts.extend_from_slice(ANCHOR_VALUE_OPTIONS);
-    let mut flags = vec!["json", "help"];
+    let mut flags = vec!["json", "help", "create-mint-store"];
     flags.extend_from_slice(ANCHOR_FLAG_OPTIONS);
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
@@ -810,6 +819,20 @@ fn biscuit_mint(raw: &[String]) -> Result<(), CliError> {
     };
     let caveats = parse_caveats(&args, false)?;
     let passphrase = crate::envelope::passphrase(&args)?;
+    let mint_store_path = args.get("mint-store");
+    if mint_store_path.is_none() && args.flag("create-mint-store") {
+        return Err(CliError::usage("--create-mint-store requires --mint-store"));
+    }
+    if mint_store_path.is_some() && args.get("token-id-hex").is_none() {
+        return Err(CliError::usage(
+            "--mint-store needs --token-id-hex: a random id is never minted twice anyway",
+        ));
+    }
+    if mint_store_path.is_some() && args.get("anchor-tpm-nv").is_some() {
+        return Err(CliError::usage(
+            "--mint-store with --anchor-tpm-nv is not supported yet; use --anchor-dir",
+        ));
+    }
 
     let mut vault = Vault::acquire(secret_path, false)?;
     let mut secret_doc = load_json_checked(secret_path, BISCUIT_AUTH_SK_FORMAT)?;
@@ -856,8 +879,9 @@ fn biscuit_mint(raw: &[String]) -> Result<(), CliError> {
     let step_entropy = Secret32::new(os_random_32()?);
     let hedge = Secret32::new(os_random_32()?);
     let dp = FrontierDpTable::build(FrontierFtsProfile::Compact1122);
-    let (token, step1) = auth_sk
-        .mint(
+    let (token, step1) = match mint_store_path {
+        // The id is consumed before the leaf is signed; see PqBiscuitAuthorityKey::mint_once.
+        Some(store_path) => auth_sk.mint_once(
             &dp,
             token_id,
             audience,
@@ -865,8 +889,19 @@ fn biscuit_mint(raw: &[String]) -> Result<(), CliError> {
             step_entropy.0,
             &hedge.0,
             &CpuReferenceBackend,
-        )
-        .map_err(map_cap_err)?;
+            &mut open_mint_store(&args, store_path)?,
+        ),
+        None => auth_sk.mint(
+            &dp,
+            token_id,
+            audience,
+            &caveats,
+            step_entropy.0,
+            &hedge.0,
+            &CpuReferenceBackend,
+        ),
+    }
+    .map_err(map_cap_err)?;
 
     // Persist the consumed leaf before advancing the external floor. Failed resealing
     // must leave both states unchanged; a later anchor failure only burns a leaf.
@@ -1022,19 +1057,43 @@ fn seal_store_anchor_key_path(store_path: &str) -> String {
 /// store, pinned in the external anchor the options name. A store is opened the way
 /// it was created: an anchored one needs its anchor, an unanchored one the waiver.
 fn open_seal_store(args: &Args) -> Result<FsSealConsumptionStore, CliError> {
+    open_consumption_store(
+        args,
+        args.require("seal-store")?,
+        args.flag("create-seal-store"),
+        SEAL_STORE_ANCHOR_DOMAIN,
+        "Biscuit seal consumption store",
+    )
+}
+
+/// The same for an authority's issuance store (`mint --mint-store`).
+fn open_mint_store(args: &Args, store_path: &str) -> Result<FsSealConsumptionStore, CliError> {
+    open_consumption_store(
+        args,
+        store_path,
+        args.flag("create-mint-store"),
+        MINT_STORE_ANCHOR_DOMAIN,
+        "Biscuit mint store",
+    )
+}
+
+fn open_consumption_store(
+    args: &Args,
+    store_path: &str,
+    create: bool,
+    anchor_domain: &str,
+    what: &str,
+) -> Result<FsSealConsumptionStore, CliError> {
     const CAPACITY: usize = dregg_sig_policy::MAX_BURNED_INTENT_NONCES;
-    let store_path = args.require("seal-store")?;
     let anchor_cfg = AnchorConfig::from_args(args)?;
     require_anchor_or_waiver(
         anchor_cfg.is_some(),
         args.flag("ephemeral-unanchored"),
         "anchor-dir",
     )?;
-    let store_error = |e: std::io::Error| {
-        CliError::state(format!("Biscuit seal consumption store {store_path}: {e}"))
-    };
+    let store_error = |e: std::io::Error| CliError::state(format!("{what} {store_path}: {e}"));
     let Some(cfg) = &anchor_cfg else {
-        return if args.flag("create-seal-store") {
+        return if create {
             FsSealConsumptionStore::create_new(store_path, CAPACITY)
         } else {
             FsSealConsumptionStore::open_existing(store_path, CAPACITY)
@@ -1042,7 +1101,7 @@ fn open_seal_store(args: &Args) -> Result<FsSealConsumptionStore, CliError> {
         .map_err(store_error);
     };
     let key_path = seal_store_anchor_key_path(store_path);
-    if args.flag("create-seal-store") {
+    if create {
         crate::anchor::preflight_tpm_enrollment(Some(cfg), args, 1)?;
         ensure_absent(store_path)?;
         ensure_absent(&key_path)?;
@@ -1052,7 +1111,7 @@ fn open_seal_store(args: &Args) -> Result<FsSealConsumptionStore, CliError> {
             cfg,
             &[store_path],
             &[],
-            SEAL_STORE_ANCHOR_DOMAIN,
+            anchor_domain,
             domain_id,
             anchor_key.0,
         )?;
@@ -1078,7 +1137,7 @@ fn open_seal_store(args: &Args) -> Result<FsSealConsumptionStore, CliError> {
         cfg,
         &[store_path],
         &[],
-        SEAL_STORE_ANCHOR_DOMAIN,
+        anchor_domain,
         domain_id,
         anchor_key.0,
     )?;

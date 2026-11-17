@@ -16,7 +16,7 @@ pub mod seal_store;
 pub use biscuit::{
     MAX_AUTHORITY_TREE_HEIGHT, MAX_BISCUIT_HOPS, PQ_BISCUIT_HOP_CRYPTO_BYTES, PqBiscuit,
     PqBiscuitAuthorityKey, PqBiscuitAuthorityPublicKey, PqBiscuitHopBlock, PqBiscuitSeal,
-    PqBiscuitStepKey, capability_request_digest,
+    PqBiscuitStepKey, capability_request_digest, mint_once_id,
 };
 pub use dregg_sig_addr::policy_signing_key_id;
 pub use durable::PolicyGuardError;

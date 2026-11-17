@@ -3399,6 +3399,133 @@ fn e2e_policy_macaroon_attenuation_third_party_discharge_and_refusal() {
     );
 }
 
+#[test]
+fn e2e_policy_biscuit_mint_store_mints_one_token_per_id() {
+    let dir = Workdir::new("policy-biscuit-mint-store");
+    let auth_sk = dir.path("auth.sk");
+    let auth_pk = dir.path("auth.pk");
+    let mint_store = dir.path("mint-ledger");
+    let audience = &"12".repeat(32);
+    let order = &"7a".repeat(32);
+    let resource = &"34".repeat(32);
+    expect(
+        &[
+            "policy",
+            "biscuit",
+            "keygen",
+            "--secret-out",
+            &auth_sk,
+            "--public-out",
+            &auth_pk,
+            "--tree-height",
+            "2",
+        ],
+        0,
+    );
+    let mint = |id: &str, out: &str, step: &str, store: Option<&str>, create: bool| {
+        let mut args = vec![
+            "policy",
+            "biscuit",
+            "mint",
+            "--secret",
+            &auth_sk,
+            "--audience-hex",
+            audience,
+            "--resource-hex",
+            resource,
+            "--token-out",
+            out,
+            "--step-key-out",
+            step,
+        ];
+        if !id.is_empty() {
+            args.extend_from_slice(&["--token-id-hex", id]);
+        }
+        if let Some(store) = store {
+            args.extend_from_slice(&["--mint-store", store]);
+        }
+        if create {
+            args.push("--create-mint-store");
+        }
+        args.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+    };
+    let run = |args: Vec<String>, code: i32| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        expect(&refs, code)
+    };
+
+    // Without the store, one id mints twice: the gap the store closes.
+    run(
+        mint(order, &dir.path("p1.json"), &dir.path("p1.sk"), None, false),
+        0,
+    );
+    run(
+        mint(order, &dir.path("p2.json"), &dir.path("p2.sk"), None, false),
+        0,
+    );
+
+    let other = &"7b".repeat(32);
+    run(
+        mint(
+            other,
+            &dir.path("a.json"),
+            &dir.path("a.sk"),
+            Some(&mint_store),
+            true,
+        ),
+        0,
+    );
+    // The same id again is refused, and nothing is written.
+    let out = qsag(
+        &mint(
+            other,
+            &dir.path("b.json"),
+            &dir.path("b.sk"),
+            Some(&mint_store),
+            false,
+        )
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>(),
+    );
+    assert_eq!(code(&out), 3, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Replay"));
+    assert!(!std::path::Path::new(&dir.path("b.json")).exists());
+    assert!(!std::path::Path::new(&dir.path("b.sk")).exists());
+    // The store cannot be created twice, and a mint store needs an explicit id.
+    run(
+        mint(
+            &"7c".repeat(32),
+            &dir.path("c.json"),
+            &dir.path("c.sk"),
+            Some(&mint_store),
+            true,
+        ),
+        4,
+    );
+    run(
+        mint(
+            "",
+            &dir.path("d.json"),
+            &dir.path("d.sk"),
+            Some(&mint_store),
+            false,
+        ),
+        1,
+    );
+    // The refused mints spent no leaf: the fourth and last leaf still mints.
+    run(
+        mint(
+            &"7d".repeat(32),
+            &dir.path("e.json"),
+            &dir.path("e.sk"),
+            Some(&mint_store),
+            false,
+        ),
+        0,
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_policy_biscuit_anchored_mint_attenuate_step_retirement_seal_and_rollback() {
