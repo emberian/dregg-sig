@@ -118,7 +118,7 @@ Rules the ABI keeps:
 - **no panic crossing the boundary** — `catch_unwind` wraps every entry point, and a caught panic
   becomes `DREGG_SIG_ERR_PANIC`;
 - **secret keys zeroized** — every Rust-side copy on drop, and the caller's output buffer on every
-  error path in `keygen` and `keygen_from_seed`;
+  error path in `keygen` and `keygen_from_seed`, including a public-key buffer that is too small;
 - **no overlapping buffers** — an output buffer must not alias an input or another output.
 
 A short output buffer is refused with `DREGG_SIG_ERR_BUFFER_TOO_SMALL` **and** the required length

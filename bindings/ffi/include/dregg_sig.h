@@ -83,8 +83,9 @@ int dregg_sig_shake256_32(const uint8_t *input, size_t input_len,
                           uint8_t *out, size_t out_len, size_t *written);
 
 /* Generate a keypair from explicit (SK.seed, SK.prf, PK.seed) components.
-* Writes 4*n secret-key bytes and 2*n public-key bytes. On any error the
-* secret-key output buffer is wiped before returning. */
+* Writes 4*n secret-key bytes and 2*n public-key bytes. On any error,
+* including a public-key buffer that is too small, the secret-key output
+* buffer is wiped before returning. */
 int dregg_sig_keygen(uint32_t param,
                      const uint8_t *sk_seed, size_t sk_seed_len,
                      const uint8_t *sk_prf, size_t sk_prf_len,
@@ -92,7 +93,8 @@ int dregg_sig_keygen(uint32_t param,
                      uint8_t *sk_out, size_t sk_out_len, size_t *sk_written,
                      uint8_t *pk_out, size_t pk_out_len, size_t *pk_written);
 
-/* Generate a keypair from one master seed. */
+/* Generate a keypair from one master seed. On any error the secret-key
+* output buffer is wiped before returning. */
 int dregg_sig_keygen_from_seed(uint32_t param,
                                const uint8_t *seed, size_t seed_len,
                                uint8_t *sk_out, size_t sk_out_len, size_t *sk_written,

@@ -149,6 +149,27 @@ int main(void) {
                         sizeof long_ctx, sig, sizeof sig, &sig_written);
     check(rc == DREGG_SIG_ERR_CONTEXT_TOO_LONG, "over-long context is refused");
 
+    /* A public-key buffer too small fails keygen after the secret key is written: the
+     * secret-key buffer must come back wiped, not holding the key. */
+    {
+        uint8_t small_pk[16];
+        size_t small_pk_written = 0;
+        memset(sk, 0, sizeof sk);
+        rc = dregg_sig_keygen(DREGG_SIG_PARAM_128F, sk_seed, 16, sk_prf, 16, pk_seed, 16, sk,
+                              sizeof sk, &sk_written, small_pk, sizeof small_pk,
+                              &small_pk_written);
+        check(rc == DREGG_SIG_ERR_BUFFER_TOO_SMALL, "short public-key buffer is refused");
+        check(small_pk_written == pk_len, "short public-key buffer reports the required length");
+        int sk_clear = 1;
+        for (size_t i = 0; i < sizeof sk; i++) {
+            if (sk[i] != 0) {
+                sk_clear = 0;
+                break;
+            }
+        }
+        check(sk_clear, "a short public-key buffer leaves no secret key behind");
+    }
+
     /* A failed keygen wipes the secret-key output buffer. */
     memset(sk, 0xAA, sizeof sk);
     rc = dregg_sig_keygen(DREGG_SIG_PARAM_128F, sk_seed, 15, sk_prf, 16, pk_seed, 16, sk, sizeof sk,

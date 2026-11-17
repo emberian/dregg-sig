@@ -155,8 +155,8 @@ pub unsafe extern "C" fn dregg_sig_wipe(buf: *mut u8, len: usize) {
 
 /// Generate a keypair from explicit `(SK.seed, SK.prf, PK.seed)` components.
 ///
-/// Writes `4*n` secret-key bytes and `2*n` public-key bytes. On any error the secret-key
-/// output buffer is wiped before returning.
+/// Writes `4*n` secret-key bytes and `2*n` public-key bytes. On any error, including a
+/// public-key buffer that is too small, the secret-key output buffer is wiped before returning.
 ///
 /// # Safety
 /// Every pointer must be null or valid for the length given beside it.
@@ -193,7 +193,15 @@ pub unsafe extern "C" fn dregg_sig_keygen(
                     }
                     return rc;
                 }
-                unsafe { emit(&pk, pk_out, pk_out_len, pk_written) }
+                let rc = unsafe { emit(&pk, pk_out, pk_out_len, pk_written) };
+                if rc != DREGG_SIG_OK {
+                    // The secret key is already in the caller's buffer; a failed call must
+                    // not leave it there.
+                    if let Some(dst) = unsafe { output(sk_out, sk_out_len) } {
+                        api::wipe(dst);
+                    }
+                }
+                rc
             }
             Err(code) => {
                 if let Some(dst) = unsafe { output(sk_out, sk_out_len) } {
@@ -206,6 +214,9 @@ pub unsafe extern "C" fn dregg_sig_keygen(
 }
 
 /// Generate a keypair from one master seed.
+///
+/// On any error, including a public-key buffer that is too small, the secret-key output
+/// buffer is wiped before returning.
 ///
 /// # Safety
 /// Every pointer must be null or valid for the length given beside it.
@@ -234,7 +245,15 @@ pub unsafe extern "C" fn dregg_sig_keygen_from_seed(
                     }
                     return rc;
                 }
-                unsafe { emit(&pk, pk_out, pk_out_len, pk_written) }
+                let rc = unsafe { emit(&pk, pk_out, pk_out_len, pk_written) };
+                if rc != DREGG_SIG_OK {
+                    // The secret key is already in the caller's buffer; a failed call must
+                    // not leave it there.
+                    if let Some(dst) = unsafe { output(sk_out, sk_out_len) } {
+                        api::wipe(dst);
+                    }
+                }
+                rc
             }
             Err(code) => {
                 if let Some(dst) = unsafe { output(sk_out, sk_out_len) } {

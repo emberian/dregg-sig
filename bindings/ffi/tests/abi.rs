@@ -206,6 +206,64 @@ fn a_failed_keygen_wipes_the_secret_key_buffer() {
 }
 
 #[test]
+fn a_short_public_key_buffer_wipes_the_secret_key_already_written() {
+    // The secret key is copied out before the public key; a public-key buffer that is too
+    // small fails the call after the secret is in the caller's buffer.
+    let sk_seed = unhex(&field("sk_seed_hex"));
+    let sk_prf = unhex(&field("sk_prf_hex"));
+    let pk_seed = unhex(&field("pk_seed_hex"));
+
+    let mut sk = [0u8; 64];
+    let mut pk = [0u8; 16];
+    let mut sk_w = 0usize;
+    let mut pk_w = 0usize;
+    let rc = unsafe {
+        dregg_sig_keygen(
+            DREGG_SIG_PARAM_128F,
+            sk_seed.as_ptr(),
+            16,
+            sk_prf.as_ptr(),
+            16,
+            pk_seed.as_ptr(),
+            16,
+            sk.as_mut_ptr(),
+            sk.len(),
+            &mut sk_w,
+            pk.as_mut_ptr(),
+            pk.len(),
+            &mut pk_w,
+        )
+    };
+    assert_eq!(rc, DREGG_SIG_ERR_BUFFER_TOO_SMALL);
+    assert_eq!(pk_w, 32, "the required public-key length is still reported");
+    assert!(
+        sk.iter().all(|&b| b == 0),
+        "keygen left the secret key in the buffer"
+    );
+
+    let seed = [7u8; 48];
+    let mut sk = [0u8; 64];
+    let rc = unsafe {
+        dregg_sig_keygen_from_seed(
+            DREGG_SIG_PARAM_128F,
+            seed.as_ptr(),
+            seed.len(),
+            sk.as_mut_ptr(),
+            sk.len(),
+            &mut sk_w,
+            core::ptr::null_mut(),
+            32,
+            &mut pk_w,
+        )
+    };
+    assert_eq!(rc, DREGG_SIG_ERR_NULL_POINTER);
+    assert!(
+        sk.iter().all(|&b| b == 0),
+        "keygen_from_seed left the secret key in the buffer"
+    );
+}
+
+#[test]
 fn the_max_constants_are_the_max_over_all_six_sets() {
     let ids = [
         api::PARAM_128S,
