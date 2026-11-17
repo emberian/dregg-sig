@@ -1,0 +1,25 @@
+[package]
+name = "dregg-sig-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.99.1"
+description = "C ABI for the stateless FIPS 205 SLH-DSA surface of dregg-sig-core: caller-allocated buffers, integer error codes, no panic across the boundary."
+
+# Its own workspace: the library workspace stays free of crates.io dependencies.
+[workspace]
+
+[lib]
+name = "dregg_sig_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+dregg-sig-core = { path = "../../crates/core", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "dregg-sig-header"
+path = "src/bin/header.rs"
+
+[[bin]]
+name = "dregg-sig-native-bench"
+path = "src/bin/native_bench.rs"
