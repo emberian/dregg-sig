@@ -1,0 +1,18 @@
+[package]
+name = "dregg-sig-python"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.99.1"
+description = "Python (abi3) bindings for the stateless FIPS 205 SLH-DSA surface of dregg-sig-core. Bytes in, bytes out; the GIL is released during keygen and sign."
+
+# Its own workspace: the library workspace stays free of crates.io dependencies.
+[workspace]
+
+[lib]
+name = "dregg_sig"
+crate-type = ["cdylib"]
+
+[dependencies]
+dregg-sig-ffi = { path = "../ffi" }
+pyo3 = { version = "0.30", features = ["abi3-py39", "extension-module"] }
