@@ -26,7 +26,7 @@
 
 use std::sync::OnceLock;
 
-use dregg_sig_agg::pcs::WhirSecurityRegime;
+use dregg_sig_agg::zk_hem::v2::params::Profile;
 use dregg_sig_migrate::hem::relations::{
     BatchStatement, Bip32Root, HdNode, KeySource, Lock, OwnershipProof, OwnershipStatement,
     OwnershipWitness, prove_batch, prove_ownership, verify_batch, verify_ownership,
@@ -35,7 +35,7 @@ use libfuzzer_sys::fuzz_target;
 
 /// Regime of the seed proofs. Its proof-of-work grinds through the assembly Keccak
 /// kernel, which coverage instrumentation does not slow down.
-const REGIME: WhirSecurityRegime = WhirSecurityRegime::BciksJohnsonQrom128;
+const REGIME: Profile = Profile::TurboShakeJohnson400;
 
 struct Fixtures {
     statement: OwnershipStatement,

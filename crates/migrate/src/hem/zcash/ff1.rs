@@ -130,6 +130,7 @@ impl Aes256 {
                 }
             }
             s = t;
+            dregg_sig_asm::volatile_fill(&mut t, 0);
             xor_into(&mut s, &self.round_keys[round]);
         }
         s

@@ -1,81 +1,59 @@
-//! One custodian's side of the collaborative zk-Hem prover.
+//! One custodian's side of the collaborative `zk-Hem v2` prover (`QuinticGoldilocks`).
 //!
-//! The steps, what each opens and why each opening is safe are in the module comment of
-//! [`super`]. Every custodian runs [`prove_party`] with its authenticated shares of the
-//! assignment and ends with the same [`ZkHemSplitProof`], which it has verified.
+//! Every custodian runs [`prove_party`] with its MAC-authenticated shares of the
+//! assignment (`Sb`) and ends with the same [`ZkHemV2SplitProof`] (`QSAGZKS2`), which it
+//! verifies locally before returning.
 //!
-//! # Lookups
+//! # Algebra & MPC Upgrades (`zk-Hem v2`)
 //!
-//! A relation with lookups (`zk_hem::relation::Lookups`, steps L1 to L4 of
-//! `zk_hem::protocol`) is proved on shares as follows. The multiplicities are variables of
-//! the assignment, so their shares arrive with `z` like every other variable.
-//!
-//! * Helpers. For a fraction with a shared value `v` and a public numerator `c` (a
-//!   lookup), `h = c / (alpha - v)` by the masked inversion of Bar-Ilan and Beaver: open
-//!   `w = r (alpha - v)` for a preprocessed uniform `r` in the extension field and set
-//!   `h = (c / w) r`. `r v` is four base-field products per tuple column that is not a
-//!   public constant. `w` is uniform whatever was sent before, like a Beaver opening. For
-//!   a fraction with a public value (a table row), `h = n / (alpha - v)` is linear in the
-//!   shared numerator. The four masking helpers are preprocessed uniform values.
-//! * Helper commitment. Each custodian commits to the value part of its shares of the
-//!   helper table (helper limbs, the lookup sumcheck mask, blinders: all authenticated)
-//!   and to four companions of its own, and broadcasts the root. The transcript binds the
-//!   list of helper roots.
-//! * Lookup sumcheck of `sel (h + lambda eq (h (alpha - v) - n))`. Per round and live pair
-//!   of entries three extension-field products give `h(X) v(X)`; everything else is
-//!   public or linear, and the linear coefficient of a round polynomial is taken from the
-//!   running claim. Opened, each after a MAC check: the mask sum, the masked round
-//!   polynomials, then `(n, v, h)(rl)`.
-//! * The column sumcheck takes the two lookup weights; the zero test covers the helper
-//!   table's linear claim with a second uniform multiplier; the companion claims, the
-//!   blended helper word and the Stage-0 leaves of the helper roots follow those of the
-//!   assignment table.
-//!
-//! Privacy is the argument of [`super`] with the helper table in the place of the
-//! assignment table: the inversion openings are one-time-padded, the round polynomials are
-//! masked, the three revealed values are uniform by the masking entries for a satisfying
-//! and for an unsatisfying assignment alike, and nothing that depends on the helper claim
-//! is opened before the zero test. As there, this is an argument and not a proof.
-//!
-//! Cost per custodian for `L` lookups of one shared column and `2^d` fractions: `4 L`
-//! triples for the inversions and 48 per live pair of the sumcheck, about `48 * 2^d` in
-//! all, against `17 * 8` per byte for a bit decomposition in the row sumcheck.
-//! [`prover_demand`] is exact. Not here, as for every other hint: producing the shares of
-//! the multiplicities from shares of the looked-up values, which needs their one-hot
-//! encodings (`2^b - b - 1` products from the `b` shared bits of a value in a `b`-bit
-//! table: 247 for a byte, 11 for a nibble).
+//! * **9-triple Toom-3 `Fp5` Beaver products:** Every extension-field multiplication in the
+//!   row sumcheck (rounds `1..`), the LogUp lookup sumcheck, and the pre-opening SPDZ zero
+//!   test runs [`Engine::mul_ext`] at `9` base-field triples per `Fp5` product (43.75%
+//!   fewer triples than `Fp4` schoolbook's 16).
+//! * **Per-tree 256-bit `tree_nonce`:** Each custodian samples a fresh 32-byte `tree_nonce`
+//!   alongside its `salt_seed` and `mask_poly` for every Stage-0 Merkle tree, eliminating
+//!   multi-tree salt birthday collisions across custodians and helper tables.
+//! * **Authenticated Stage-0 folding (`0` triples):** After the SPDZ zero test confirms
+//!   `<table, cell_weights> == value` (and `<helper, helper_weights> == helper_value`),
+//!   custodians convert their authenticated hypercube shares to monomial shares locally and
+//!   run WHIR Stage-0 Rounds 7–9 (`MASK_EVAL`, `FOLD_A`, `FOLD_B`) directly on authenticated
+//!   `Sh` shares (`0` Beaver triples, MAC-checked before every round opening and before the
+//!   reduced masked polynomial `g = P_s + beta_R R` is revealed).
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use dregg_sig_agg::field::{Goldilocks, GoldilocksExt4, GoldilocksOps as _, build_eq_table_ext4};
-use dregg_sig_agg::pcs::{
-    CanopyCommitment, CanopyMultiProof, Stage0ShareOpening, WhirSecurityRegime,
-    hypercube_to_monomial_coeffs_ext4, whir_commit_batch_secret_with_schedule,
-    whir_open_blend_split, whir_stage0_open_share,
+use dregg_sig_agg::field::Goldilocks;
+use dregg_sig_agg::pcs::hypercube_to_monomial_coeffs;
+use dregg_sig_agg::zk_hem::relation::{Csr, Lookups, Shape};
+use dregg_sig_agg::zk_hem::v2::field5::Fp5;
+use dregg_sig_agg::zk_hem::v2::hash::{Digest, Transcript};
+use dregg_sig_agg::zk_hem::v2::params::{
+    COL_DEGREE, COL_MASK_BITS, DIGEST_BYTES, EXT_BYTES, LIMBS, LOOKUP_DEGREE, LOOKUP_MASK_BITS,
+    LookupLayout, MASK_POINTS, Profile, ROW_DEGREE, ROW_MASK_BITS, Schedule, TREE_NONCE_BYTES,
 };
-use dregg_sig_agg::pcs::{
-    HemWhirProverState, HemWhirSplitOpeningProof, WeightedPoint, WhirSchedule,
+use dregg_sig_agg::zk_hem::v2::pcs::{
+    self, Committed, MAX_STAGE0_SHARES, SplitOpening, Stage0Query,
 };
-use dregg_sig_agg::zk_hem::protocol::{
-    COL_DEGREE, COL_MASK_BITS, COMPANIONS, FrontMessages, LOOKUP_DEGREE, LOOKUP_MASK_BITS, Layout,
-    LookupLayout, LookupMessages, LookupRoots, MAX_SPLIT_COMMITTERS, ROW_DEGREE, ROW_MASK_BITS,
-    SplitLookupProof, ZkHemSplitProof, blend_claim, claim_kernel, lookup_column_add,
-    lookup_masks_full_rank, mask_rows_full_rank, replay_front, split_transcript, verify_split,
+use dregg_sig_agg::zk_hem::v2::protocol::{
+    FrontMessages, LookupMessages, Mask, SplitLookupV2Proof, ZkHemV2SplitProof,
+    absorb_lookup_roots, cell_weights_to_kernel, column_table, eq_table, layout_of, limb_basis,
+    lookup_column_add, lookup_masks_full_rank, replay_front, row_challenge_good, split_transcript,
+    verify_split,
 };
-use dregg_sig_agg::zk_hem::relation::{Csr, LOOKUP_MASK_ENTRIES, Lookups, Shape};
-use dregg_sig_agg::zk_hem::{LibraMask, NonzeroChallenge};
 
-use super::engine::{Engine, MpcError, Sb, Sh};
+use dregg_sig_core::wipe::{SecretBuffer, SecretScratch};
+
+use super::engine::{EXT_MUL_TRIPLES, Engine, MpcError, Sb, Sh};
 use super::net::Transport;
 
-type E = GoldilocksExt4;
+type E = Fp5;
 type F = Goldilocks;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProveError {
     Mpc(MpcError),
-    /// The relation does not fit a commitment, or the quorum is too large.
+    /// The relation does not fit a v2 commitment, or the quorum is too large.
     Unsupported,
     /// The relation has S-box rows.
     SboxRows,
@@ -85,9 +63,9 @@ pub enum ProveError {
     BadPeerMessage {
         from: usize,
     },
-    /// A row challenge `tau_i` is zero (probability `2^-256` per round).
+    /// A row or lookup challenge hit a degenerate point.
     DegenerateChallenge,
-    /// The row point left the masking rows without full rank; rerun with fresh material.
+    /// A verifier coin fell outside the event `Good`; rerun with fresh material.
     MaskRankDeficient,
     /// The shared assignment does not satisfy the relation. Nothing that depends on the
     /// assignment beyond this one bit has been opened.
@@ -110,23 +88,26 @@ pub enum Fault<'a> {
     Table(&'a mut Vec<F>),
     /// The share of a masked row-round polynomial about to be opened.
     RoundShare(&'a mut Vec<Sh>),
-    /// The share of the blended word about to be sent, 32 bytes a cell.
+    /// The share of the reduced Stage-0 masked polynomial `g` about to be sent, 40 bytes/coeff.
     Word(&'a mut Vec<u8>),
     /// The Stage-0 leaves about to be opened.
-    Leaves(&'a mut Stage0ShareOpening),
+    Leaves(&'a mut Stage0Query),
 }
 
 /// Triples and uniform values one custodian's [`prove_party`] consumes for `shape`.
-pub fn prover_demand(shape: &Shape, regime: WhirSecurityRegime) -> Option<(usize, usize)> {
-    let layout = Layout::new(shape, regime)?;
+pub fn prover_demand(shape: &Shape, _profile: Profile) -> Option<(usize, usize)> {
+    if shape.num_sbox != 0 {
+        return None;
+    }
+    let layout = layout_of(shape)?;
     let half = 1usize << (shape.log_rows - 1);
-    // Round 0 multiplies base-field values, later rounds extension-field values; the
-    // zero test is one extension-field product.
-    let triples = 2 * half + 32 * (half - 1) + 16;
-    let randoms = shape.num_vars - shape.mask_var_base
-        + 4 * (shape.log_rows * (ROW_DEGREE + 1) + layout.var_bits * (COL_DEGREE + 1))
+    // Round 0 multiplies base-field values (1 triple each); rounds 1.. multiply Fp5 values
+    // via 9-triple Toom-3 (2 * 9 = 18 triples per pair); the zero test is 1 Fp5 product (9).
+    let triples = 2 * half + (2 * EXT_MUL_TRIPLES) * (half - 1) + EXT_MUL_TRIPLES;
+    let randoms = (shape.num_vars - shape.mask_var_base)
+        + LIMBS * (shape.log_rows * (ROW_DEGREE + 1) + layout.var_bits * (COL_DEGREE + 1))
         + layout.blind_cells
-        + 4;
+        + LIMBS;
     let (lookup_triples, lookup_randoms) = match (shape.lookups(), &layout.lookup) {
         (Some(lookups), Some(ll)) => lookup_demand(lookups, ll)?,
         _ => (0, 0),
@@ -136,8 +117,6 @@ pub fn prover_demand(shape: &Shape, regime: WhirSecurityRegime) -> Option<(usize
 
 /// How the helper of one fraction is computed from shares.
 enum Helper {
-    /// Numerator zero: the helper is zero.
-    Zero,
     /// Public value `v`: `h = n / (alpha - v)`.
     PublicValue,
     /// Public numerator and shared value with this many shared tuple columns.
@@ -152,11 +131,8 @@ fn public_form(matrix: &Csr, i: usize) -> Option<F> {
 }
 
 /// `None` for a fraction with a shared numerator over a shared value, which the builder
-/// never produces.
+/// only places in the unconstrained masking corner `checked..`.
 fn helper_kind(lookups: &Lookups, i: usize) -> Option<Helper> {
-    if lookups.num.row(i).next().is_none() {
-        return Some(Helper::Zero);
-    }
     let shared_columns = lookups
         .den
         .iter()
@@ -182,58 +158,57 @@ fn lookup_demand(lookups: &Lookups, ll: &LookupLayout) -> Option<(usize, usize)>
     let (mut triples, mut randoms) = (0, 0);
     for i in 0..lookups.num_checked() {
         if let Helper::Inversion { shared_columns } = helper_kind(lookups, i)? {
-            triples += 4 * shared_columns;
-            randoms += 4;
+            triples += LIMBS * shared_columns;
+            randoms += LIMBS;
         }
     }
     triples += (0..d)
-        .map(|round| 48 * lookup_live_pairs(lookups, round))
+        .map(|round| (3 * EXT_MUL_TRIPLES) * lookup_live_pairs(lookups, round))
         .sum::<usize>();
-    // The second zero-test product and its multiplier.
-    triples += 16;
-    randoms += 4 * LOOKUP_MASK_ENTRIES + 4 * d * (LOOKUP_DEGREE + 1) + ll.blind_cells + 4;
+    // Second zero-test product and its Fp5 multiplier.
+    triples += EXT_MUL_TRIPLES;
+    randoms += LIMBS * (lookups.num_entries() - lookups.num_checked()) + LIMBS * d * (LOOKUP_DEGREE + 1) + ll.blind_cells + LIMBS;
     Some((triples, randoms))
 }
 
-/// An authenticated sumcheck mask: the three components of the coefficient shares.
+/// An authenticated separable sumcheck mask: the three SPDZ components (`v`, `m[0]`, `m[1]`)
+/// of its `Fp5` coefficient shares.
 struct MaskShare {
-    parts: [LibraMask; 3],
+    parts: [Mask; 3],
 }
 
 impl MaskShare {
-    fn new(coef: &[Vec<Sh>]) -> Self {
-        let part = |pick: fn(&Sh) -> E| LibraMask {
-            a0: coef.iter().fold(E::ZERO, |acc, row| acc + pick(&row[0])),
-            a: coef
-                .iter()
-                .map(|row| row[1..].iter().map(pick).collect())
-                .collect(),
+    fn new(coef: &[SecretScratch<Sh>]) -> Self {
+        let part = |pick: fn(&Sh) -> E| {
+            Mask::from_coeffs(coef.iter().map(|row| row.iter().map(pick).collect()).collect())
         };
         Self {
             parts: [part(|s| s.v), part(|s| s.m[0]), part(|s| s.m[1])],
         }
     }
 
-    fn zip(parts: [Vec<E>; 3]) -> Vec<Sh> {
-        let [v, m0, m1] = parts;
-        v.into_iter()
-            .zip(m0)
-            .zip(m1)
-            .map(|((v, m0), m1)| Sh { v, m: [m0, m1] })
-            .collect()
-    }
-
     fn sum(&self) -> Sh {
-        Self::zip(self.parts.each_ref().map(|p| vec![p.sum()]))[0]
+        Sh {
+            v: self.parts[0].sum(),
+            m: [self.parts[1].sum(), self.parts[2].sum()],
+        }
     }
 
-    fn round_poly(&self, prefix: &[E]) -> Vec<Sh> {
-        Self::zip(self.parts.each_ref().map(|p| p.round_poly(prefix)))
+    fn round_poly(&self, prefix: &[E]) -> SecretBuffer<Vec<Sh>> {
+        let mut parts = self.parts.each_ref().map(|p| p.round_poly(prefix));
+        let out = (0..parts[0].len()).map(|i| Sh {
+            v: parts[0][i],
+            m: [parts[1][i], parts[2][i]],
+        }).collect();
+        for part in &mut parts {
+            dregg_sig_asm::volatile_fill(part, E::ZERO);
+        }
+        SecretBuffer(out)
     }
 }
 
-/// Sample one mask: per round `degree + 1` coefficients, each from four uniform base
-/// values, and the cells that hold them in the committed table.
+/// Sample one separable mask: per round `degree + 1` coefficients, each from five uniform
+/// base values, and write the corresponding hypercube values into `table`.
 fn sample_mask<T: Transport>(
     e: &mut Engine<T>,
     table: &mut [Sb],
@@ -242,35 +217,31 @@ fn sample_mask<T: Transport>(
     bits: usize,
     block: impl Fn(usize, usize) -> usize,
 ) -> Result<MaskShare, MpcError> {
-    let unit: [E; 4] = core::array::from_fn(|j| {
-        let mut limbs = [F::ZERO; 4];
-        limbs[j] = F::ONE;
-        E::from_limbs(limbs)
-    });
+    let unit = limb_basis();
     let mut coef = Vec::with_capacity(rounds);
     for i in 0..rounds {
-        let mut cells = vec![[Sb::ZERO; 4]; 1 << bits];
-        let mut row = Vec::with_capacity(degree + 1);
+        let mut cells = SecretScratch::from(vec![[Sb::ZERO; LIMBS]; 1 << bits]);
+        let mut row = SecretScratch::with_capacity(degree + 1);
         for cell in cells.iter_mut().take(degree + 1) {
-            let mut c = Sh::ZERO;
-            for j in 0..4 {
+            let mut c = SecretBuffer(Sh::ZERO);
+            for j in 0..LIMBS {
                 cell[j] = e.random()?;
-                c += cell[j].scale_ext(unit[j]);
+                *c += cell[j].scale_ext(unit[j]);
             }
-            row.push(c);
+            row.push(*c);
         }
         // Monomial coefficients to hypercube values, limb by limb.
         for b in 0..bits {
             for idx in 0..cells.len() {
                 if (idx >> b) & 1 == 1 {
                     let lower = cells[idx ^ (1 << b)];
-                    for j in 0..4 {
+                    for j in 0..LIMBS {
                         cells[idx][j] += lower[j];
                     }
                 }
             }
         }
-        for j in 0..4 {
+        for j in 0..LIMBS {
             let off = block(i, j);
             for (slot, cell) in table[off..off + cells.len()].iter_mut().zip(&cells) {
                 *slot = cell[j];
@@ -281,7 +252,7 @@ fn sample_mask<T: Transport>(
     Ok(MaskShare::new(&coef))
 }
 
-fn eval_poly(coeffs: &[Sh], x: E) -> Sh {
+fn eval_poly_sh(coeffs: &[Sh], x: E) -> Sh {
     coeffs
         .iter()
         .rev()
@@ -289,11 +260,88 @@ fn eval_poly(coeffs: &[Sh], x: E) -> Sh {
 }
 
 /// Add the masked share of a round polynomial: `poly + rho * mask`.
-fn masked(poly: &[Sh], mask: Vec<Sh>, rho: E) -> Vec<Sh> {
-    mask.into_iter()
-        .enumerate()
-        .map(|(k, g)| g.scale(rho) + poly.get(k).copied().unwrap_or(Sh::ZERO))
-        .collect()
+fn masked(poly: &[Sh], mut mask: SecretBuffer<Vec<Sh>>, rho: E) -> SecretBuffer<Vec<Sh>> {
+    for (k, g) in mask.iter_mut().enumerate() {
+        *g = g.scale(rho) + poly.get(k).copied().unwrap_or(Sh::ZERO);
+    }
+    mask
+}
+
+/// In-place hypercube-to-monomial Möbius transform on authenticated `Sb` shares.
+fn hypercube_to_monomial_sb(coeffs: &mut [Sb]) {
+    let n = coeffs.len();
+    assert!(n.is_power_of_two());
+    let vars = n.trailing_zeros() as usize;
+    for b in 0..vars {
+        let step = 1usize << b;
+        for block in coeffs.chunks_exact_mut(step << 1) {
+            let (lo, hi) = block.split_at_mut(step);
+            for (l, h) in lo.iter().zip(hi.iter_mut()) {
+                *h = *h - *l;
+            }
+        }
+    }
+}
+
+/// Commit to the value part of `table` shares, a local random degree-bounded masking
+/// polynomial `R^(c)`, a local `salt_seed`, and a fresh 256-bit `tree_nonce`.
+fn commit_shares<T: Transport>(
+    e: &mut Engine<T>,
+    profile: Profile,
+    log_cells: usize,
+    table: &[Sb],
+    schedule: &Schedule,
+    fault: &mut dyn FnMut(Fault<'_>),
+) -> Committed {
+    let mut vals = SecretBuffer(table.iter().map(|s| s.v).collect::<Vec<_>>());
+    fault(Fault::Table(&mut vals));
+    let coeffs = hypercube_to_monomial_coeffs(&vals);
+    drop(vals);
+
+    let step_vars = schedule.stages[0].step_vars;
+    let mask_len = pcs::mask_len(log_cells, step_vars);
+    let mask_poly: Vec<E> = (0..mask_len).map(|_| e.local_ext()).collect();
+    let mut salt_seed = [0u8; 32];
+    for chunk in salt_seed.chunks_mut(8) {
+        chunk.copy_from_slice(&e.local_base().to_le_bytes());
+    }
+    let mut tree_nonce = [0u8; TREE_NONCE_BYTES];
+    for chunk in tree_nonce.chunks_mut(8) {
+        chunk.copy_from_slice(&e.local_base().to_le_bytes());
+    }
+    let committed = pcs::commit(
+        profile,
+        log_cells,
+        schedule,
+        coeffs,
+        mask_poly,
+        &salt_seed,
+        &tree_nonce,
+    );
+    dregg_sig_asm::volatile_fill(&mut salt_seed, 0u8);
+    committed
+}
+
+/// Broadcast `(tree_nonce, root)` and collect every custodian's pair in party order.
+fn exchange_roots<T: Transport>(
+    e: &mut Engine<T>,
+    nonce: &[u8; TREE_NONCE_BYTES],
+    root: &Digest,
+) -> Result<(Vec<[u8; TREE_NONCE_BYTES]>, Vec<Digest>), ProveError> {
+    let mut payload = Vec::with_capacity(TREE_NONCE_BYTES + DIGEST_BYTES);
+    payload.extend_from_slice(nonce);
+    payload.extend_from_slice(root);
+    let messages = e.exchange(payload)?;
+    let mut nonces = Vec::with_capacity(e.parties());
+    let mut roots = Vec::with_capacity(e.parties());
+    for (from, bytes) in messages.iter().enumerate() {
+        if bytes.len() != TREE_NONCE_BYTES + DIGEST_BYTES {
+            return Err(ProveError::BadPeerMessage { from });
+        }
+        nonces.push(bytes[..TREE_NONCE_BYTES].try_into().unwrap());
+        roots.push(bytes[TREE_NONCE_BYTES..].try_into().unwrap());
+    }
+    Ok((nonces, roots))
 }
 
 struct RowOutput {
@@ -303,28 +351,27 @@ struct RowOutput {
     values: [E; 3],
 }
 
-/// Masked row sumcheck of `eq(tau, x) (a b - c)` on authenticated shares. Per pair of
-/// rows and round: two products. The MAC check runs before every round polynomial is
-/// opened, so a wrong Beaver opening is caught before anything that depends on it leaves.
+/// Masked row sumcheck of `eq(tau, x) (a b - c)` on authenticated shares (`num_sbox == 0`).
 fn row_sumcheck<T: Transport>(
     e: &mut Engine<T>,
-    tr: &mut dregg_sig_agg::FiatShamirTranscript<dregg_sig_agg::InstanceBound>,
+    shape: &Shape,
+    tr: &mut Transcript,
     tau: &[E],
-    base: [Vec<Sb>; 3],
+    base: [SecretScratch<Sb>; 3],
     mask: &MaskShare,
     fault: &mut dyn FnMut(Fault<'_>),
 ) -> Result<RowOutput, ProveError> {
     let n = tau.len();
     e.check()?;
-    let mask_sum = e.open_ext(&[mask.sum()])?[0];
-    tr.absorb_ext4(b"ZKHEM_ROW_MASK_SUM", mask_sum);
-    let rho = NonzeroChallenge::squeeze(tr, b"ZKHEM_RHO1").get();
+    let mask_sum = e.open_ext(&SecretBuffer([mask.sum()])[..])?[0];
+    tr.absorb_fp5_slice(b"ROW_MASK_SUM", &[mask_sum]);
+    let rho = tr.squeeze_fp5_nonzero(b"RHO1");
 
     let mut base = Some(base);
-    let mut ext: [Vec<Sh>; 3] = core::array::from_fn(|_| Vec::new());
-    let mut eq_rest = build_eq_table_ext4(&tau[1..]);
+    let mut ext: [SecretScratch<Sh>; 3] = core::array::from_fn(|_| SecretScratch::new());
+    let mut eq_rest = eq_table(&tau[1..]);
     let mut eq_bound = E::ONE;
-    let mut claim = Sh::ZERO;
+    let mut claim = SecretBuffer(Sh::ZERO);
     let mut rounds = Vec::with_capacity(n);
     let mut point: Vec<E> = Vec::with_capacity(n);
     for &t in tau {
@@ -332,57 +379,55 @@ fn row_sumcheck<T: Transport>(
         if (l0 + l1).is_zero() {
             return Err(ProveError::DegenerateChallenge);
         }
-        let sum_inv = (l0 + l1).inv();
+        let sum_inv = (l0 + l1).inverse();
         let pairs = eq_rest.len();
-        let (mut h0, mut h2) = (Sh::ZERO, Sh::ZERO);
+        let (mut h0, mut h2) = (SecretBuffer(Sh::ZERO), SecretBuffer(Sh::ZERO));
         if let Some([a, b, c]) = &base {
-            let mut xs = Vec::with_capacity(2 * pairs);
-            let mut ys = Vec::with_capacity(2 * pairs);
+            let mut xs = SecretScratch::with_capacity(2 * pairs);
+            let mut ys = SecretScratch::with_capacity(2 * pairs);
             for k in 0..pairs {
                 xs.extend([a[2 * k], a[2 * k + 1] - a[2 * k]]);
                 ys.extend([b[2 * k], b[2 * k + 1] - b[2 * k]]);
             }
-            let products = e.mul(&xs, &ys)?;
+            let products = SecretScratch::from(e.mul(&xs, &ys)?);
             for k in 0..pairs {
-                h0 += (products[2 * k] - c[2 * k]).scale_ext(eq_rest[k]);
-                h2 += products[2 * k + 1].scale_ext(eq_rest[k]);
+                *h0 += (products[2 * k] - c[2 * k]).scale_ext(eq_rest[k]);
+                *h2 += products[2 * k + 1].scale_ext(eq_rest[k]);
             }
         } else {
             let [a, b, c] = &ext;
-            let mut xs = Vec::with_capacity(2 * pairs);
-            let mut ys = Vec::with_capacity(2 * pairs);
+            let mut xs = SecretScratch::with_capacity(2 * pairs);
+            let mut ys = SecretScratch::with_capacity(2 * pairs);
             for k in 0..pairs {
                 xs.extend([a[2 * k], a[2 * k + 1] - a[2 * k]]);
                 ys.extend([b[2 * k], b[2 * k + 1] - b[2 * k]]);
             }
-            let products = e.mul_ext(&xs, &ys)?;
+            let products = SecretScratch::from(e.mul_ext(&xs, &ys)?);
             for k in 0..pairs {
-                h0 += (products[2 * k] - c[2 * k]).scale(eq_rest[k]);
-                h2 += products[2 * k + 1].scale(eq_rest[k]);
+                *h0 += (products[2 * k] - c[2 * k]).scale(eq_rest[k]);
+                *h2 += products[2 * k + 1].scale(eq_rest[k]);
             }
         }
-        // `p(X) = (l0 + l1 X)(h0 + h1 X + h2 X^2)` with `p(0) + p(1)` the running claim.
-        let h1 = (claim - h0.scale(l0)).scale(sum_inv) - h0 - h2;
-        let pending = [
+        let h1 = SecretBuffer((*claim - h0.scale(l0)).scale(sum_inv) - *h0 - *h2);
+        let pending = SecretBuffer([
             h0.scale(l0),
             h1.scale(l0) + h0.scale(l1),
             h2.scale(l0) + h1.scale(l1),
             h2.scale(l1),
-        ];
-        let mut share = masked(&pending, mask.round_poly(&point), rho);
+        ]);
+        let mut share = masked(&pending[..], mask.round_poly(&point), rho);
         fault(Fault::RoundShare(&mut share));
         e.check()?;
         let poly = e.open_ext(&share)?;
-        tr.absorb_ext4_slice(b"ZKHEM_ROW_ROUND", &poly);
-        let c = tr.squeeze_ext4(b"ZKHEM_ROW_ROUND");
-        claim = eval_poly(&pending, c);
-        if let Some(mut tables) = base.take() {
-            for (dst, src) in ext.iter_mut().zip(&mut tables) {
+        tr.absorb_fp5_slice(b"ROW_ROUND", &poly);
+        let c = tr.squeeze_fp5(b"ROW_ROUND");
+        *claim = eval_poly_sh(&pending[..], c);
+        if let Some(tables) = base.take() {
+            for (dst, src) in ext.iter_mut().zip(&tables) {
                 *dst = src
                     .chunks_exact(2)
                     .map(|p| p[0].lift() + (p[1] - p[0]).scale_ext(c))
                     .collect();
-                dregg_sig_asm::volatile_fill(src, Sb::ZERO);
             }
         } else {
             for table in &mut ext {
@@ -390,7 +435,6 @@ fn row_sumcheck<T: Transport>(
                 for k in 0..half {
                     table[k] = table[2 * k] + (table[2 * k + 1] - table[2 * k]).scale(c);
                 }
-                dregg_sig_asm::volatile_fill(&mut table[half..], Sh::ZERO);
                 table.truncate(half);
             }
         }
@@ -402,8 +446,11 @@ fn row_sumcheck<T: Transport>(
         rounds.push(poly);
         point.push(c);
     }
+    if !row_challenge_good(shape, &point) {
+        return Err(ProveError::MaskRankDeficient);
+    }
     e.check()?;
-    let opened = e.open_ext(&[ext[0][0], ext[1][0], ext[2][0]])?;
+    let opened = e.open_ext(&SecretBuffer([ext[0][0], ext[1][0], ext[2][0]])[..])?;
     Ok(RowOutput {
         mask_sum,
         rounds,
@@ -415,21 +462,21 @@ fn row_sumcheck<T: Transport>(
 /// Masked column sumcheck of `M(y) Z(y)` for the public `M`: linear in the shares.
 fn column_sumcheck<T: Transport>(
     e: &mut Engine<T>,
-    tr: &mut dregg_sig_agg::FiatShamirTranscript<dregg_sig_agg::InstanceBound>,
+    tr: &mut Transcript,
     mut matrix: Vec<E>,
     z: &[Sb],
     mask: &MaskShare,
 ) -> Result<(E, Vec<Vec<E>>), ProveError> {
     let n = matrix.len().trailing_zeros() as usize;
     e.check()?;
-    let mask_sum = e.open_ext(&[mask.sum()])?[0];
-    tr.absorb_ext4(b"ZKHEM_COL_MASK_SUM", mask_sum);
-    let rho = NonzeroChallenge::squeeze(tr, b"ZKHEM_RHO2").get();
-    let mut ext: Vec<Sh> = Vec::new();
+    let mask_sum = e.open_ext(&SecretBuffer([mask.sum()])[..])?[0];
+    tr.absorb_fp5_slice(b"COL_MASK_SUM", &[mask_sum]);
+    let rho = tr.squeeze_fp5_nonzero(b"RHO2");
+    let mut ext: SecretScratch<Sh> = SecretScratch::new();
     let mut rounds = Vec::with_capacity(n);
     let mut point: Vec<E> = Vec::with_capacity(n);
     for round in 0..n {
-        let mut q = [Sh::ZERO; COL_DEGREE + 1];
+        let mut q = SecretBuffer([Sh::ZERO; COL_DEGREE + 1]);
         let mut add = |m: &[E], z0: Sh, z1: Sh| {
             let (dm, dz) = (m[1] - m[0], z1 - z0);
             q[0] += z0.scale(m[0]);
@@ -445,11 +492,11 @@ fn column_sumcheck<T: Transport>(
                 add(m, p[0], p[1]);
             }
         }
-        let share = masked(&q, mask.round_poly(&point), rho);
+        let share = masked(&q[..], mask.round_poly(&point), rho);
         e.check()?;
         let poly = e.open_ext(&share)?;
-        tr.absorb_ext4_slice(b"ZKHEM_COL_ROUND", &poly);
-        let c = tr.squeeze_ext4(b"ZKHEM_COL_ROUND");
+        tr.absorb_fp5_slice(b"COL_ROUND", &poly);
+        let c = tr.squeeze_fp5(b"COL_ROUND");
         ext = if round == 0 {
             z.chunks_exact(2)
                 .map(|p| p[0].lift() + (p[1] - p[0]).scale_ext(c))
@@ -469,23 +516,8 @@ fn column_sumcheck<T: Transport>(
     Ok((mask_sum, rounds))
 }
 
-/// `M(rx, y) = sum_i eq_rx[i] (r_a A + r_b B + r_c C)[i, y]` on `cells` columns.
-fn column_matrix(shape: &Shape, eq_rx: &[E], combine: &[E], cells: usize) -> Vec<E> {
-    let mut table = vec![E::ZERO; cells];
-    for (matrix, &r) in [&shape.a, &shape.b, &shape.c].into_iter().zip(combine) {
-        for (i, &weight) in eq_rx.iter().enumerate() {
-            let w = r * weight;
-            for (col, val) in matrix.row(i) {
-                table[col] += w.mul_base(val);
-            }
-        }
-    }
-    table
-}
-
-/// A product of a shared polynomial with a public one.
-fn poly_times(shared: &[Sh], public: &[E]) -> Vec<Sh> {
-    let mut out = vec![Sh::ZERO; shared.len() + public.len() - 1];
+fn poly_times(shared: &[Sh], public: &[E]) -> SecretScratch<Sh> {
+    let mut out = SecretScratch::from(vec![Sh::ZERO; shared.len() + public.len() - 1]);
     for (i, &s) in shared.iter().enumerate() {
         for (j, &p) in public.iter().enumerate() {
             out[i + j] += s.scale(p);
@@ -494,46 +526,40 @@ fn poly_times(shared: &[Sh], public: &[E]) -> Vec<Sh> {
     out
 }
 
-/// What the lookup steps L1 to L3 leave for the rest of the proof.
 struct LookupOutput {
     gamma: E,
-    roots: Vec<CanopyCommitment>,
-    state: HemWhirProverState,
-    /// This custodian's authenticated shares of the helper table.
-    table: Vec<Sb>,
+    helper_tree_nonces: Vec<[u8; TREE_NONCE_BYTES]>,
+    helper_roots: Vec<Digest>,
+    state: Committed,
+    table: SecretScratch<Sb>,
     mask_sum: E,
     rounds: Vec<Vec<E>>,
     point: Vec<E>,
     values: [E; 3],
 }
 
-/// Lookup steps L1 to L3 on authenticated shares (module comment). `z` are the shares of
-/// the variable cells.
+/// LogUp lookup front-end (Rounds L1–L3) on authenticated shares.
 fn lookup_front<T: Transport>(
     e: &mut Engine<T>,
-    tr: &mut dregg_sig_agg::FiatShamirTranscript<dregg_sig_agg::InstanceBound>,
+    profile: Profile,
+    tr: &mut Transcript,
     lookups: &Lookups,
     ll: &LookupLayout,
     z: &[Sb],
 ) -> Result<LookupOutput, ProveError> {
     let d = lookups.log_entries;
     let (entries, checked) = (lookups.num_entries(), lookups.num_checked());
-    let gamma = tr.squeeze_ext4(b"ZKHEM_LK_GAMMA");
-    let alpha = tr.squeeze_ext4(b"ZKHEM_LK_ALPHA");
-    let unit: [E; 4] = core::array::from_fn(|j| {
-        let mut limbs = [F::ZERO; 4];
-        limbs[j] = F::ONE;
-        E::from_limbs(limbs)
-    });
+    let gamma = tr.squeeze_fp5(b"LK_GAMMA");
+    let alpha = tr.squeeze_fp5(b"LK_ALPHA");
+    let unit = limb_basis();
     let form = |matrix: &Csr, i: usize| {
         matrix
             .row(i)
             .fold(Sb::ZERO, |acc, (col, val)| acc + z[col].scale(val))
     };
 
-    // Numerators and values of every fraction.
-    let mut n: Vec<Sh> = (0..entries).map(|i| form(&lookups.num, i).lift()).collect();
-    let mut v: Vec<Sh> = (0..entries)
+    let mut n: SecretScratch<Sh> = (0..entries).map(|i| form(&lookups.num, i).lift()).collect();
+    let mut v: SecretScratch<Sh> = (0..entries)
         .map(|i| {
             lookups
                 .den
@@ -543,14 +569,11 @@ fn lookup_front<T: Transport>(
         })
         .collect();
 
-    // Helpers. Inversions: `w = r (alpha - v)` with `r v` from base-field products of the
-    // limbs of `r` with the shared tuple columns.
-    let mut h = vec![Sh::ZERO; entries];
-    let mut inversions: Vec<(usize, [Sb; 4])> = Vec::new();
-    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    let mut h = SecretScratch::from(vec![Sh::ZERO; entries]);
+    let mut inversions = SecretScratch::new();
+    let (mut xs, mut ys) = (SecretScratch::new(), SecretScratch::new());
     for i in 0..checked {
         match helper_kind(lookups, i).ok_or(ProveError::Unsupported)? {
-            Helper::Zero => {}
             Helper::PublicValue => {
                 let value = lookups.den.iter().rev().fold(E::ZERO, |acc, m| {
                     acc * gamma + E::from_base(public_form(m, i).unwrap_or(F::ZERO))
@@ -558,62 +581,68 @@ fn lookup_front<T: Transport>(
                 if (alpha - value).is_zero() {
                     return Err(ProveError::DegenerateChallenge);
                 }
-                h[i] = n[i].scale((alpha - value).inv());
+                if lookups.num.row(i).next().is_some() {
+                    h[i] = n[i].scale((alpha - value).inverse());
+                }
             }
             Helper::Inversion { .. } => {
-                let r = [e.random()?, e.random()?, e.random()?, e.random()?];
+                let mut r = SecretBuffer([Sb::ZERO; LIMBS]);
+                for limb in r.iter_mut() {
+                    *limb = e.random()?;
+                }
                 for m in &lookups.den {
                     if public_form(m, i).is_none() {
                         let column = form(m, i);
-                        xs.extend(r);
-                        ys.extend([column; 4]);
+                        xs.extend_from_slice(&r[..]);
+                        ys.extend([column; LIMBS]);
                     }
                 }
-                inversions.push((i, r));
+                inversions.push((i, *r));
             }
         }
     }
-    let products = e.mul(&xs, &ys)?;
-    let mut next = products.chunks_exact(4);
-    let mut masked_values = Vec::with_capacity(inversions.len());
-    let mut pads = Vec::with_capacity(inversions.len());
-    for &(i, r) in &inversions {
-        let pad = (0..4).fold(Sh::ZERO, |acc, j| acc + r[j].scale_ext(unit[j]));
-        // `r v = sum_c gamma^c r x_c`, with public columns scaling `r` directly.
-        let mut rv = Sh::ZERO;
+    let products = SecretScratch::from(e.mul(&xs, &ys)?);
+    let mut next = products.chunks_exact(LIMBS);
+    let mut masked_values = SecretScratch::with_capacity(inversions.len());
+    let mut pads = SecretScratch::with_capacity(inversions.len());
+    for (i, r) in &inversions {
+        let i = *i;
+        let pad = SecretBuffer(Sh::from_limbs(*r));
+        let mut rv = SecretBuffer(Sh::ZERO);
         let mut weight = E::ONE;
         for m in &lookups.den {
             match public_form(m, i) {
-                Some(constant) => rv += pad.scale(weight.mul_base(constant)),
+                Some(constant) => *rv += pad.scale(weight.mul_base(constant)),
                 None => {
                     let limbs = next.next().ok_or(ProveError::Malformed)?;
-                    for j in 0..4 {
-                        rv += limbs[j].scale_ext(weight * unit[j]);
+                    for j in 0..LIMBS {
+                        *rv += limbs[j].scale_ext(weight * unit[j]);
                     }
                 }
             }
             weight *= gamma;
         }
-        masked_values.push(pad.scale(alpha) - rv);
-        pads.push(pad);
+        masked_values.push(pad.scale(alpha) - *rv);
+        pads.push(*pad);
     }
+    e.check()?;
     let opened = e.open_ext(&masked_values)?;
-    for ((&(i, _), pad), w) in inversions.iter().zip(pads).zip(opened) {
+    e.check()?;
+    for ((&(i, _), pad), w) in inversions.iter().zip(&pads).zip(opened) {
         if w.is_zero() {
             return Err(ProveError::DegenerateChallenge);
         }
         let numerator = public_form(&lookups.num, i).ok_or(ProveError::Unsupported)?;
-        h[i] = pad.scale(w.inv().mul_base(numerator));
+        h[i] = pad.scale(w.inverse().mul_base(numerator));
     }
     for slot in &mut h[checked..] {
         *slot = e.random_ext()?;
     }
 
-    // The helper table, its commitment and the list of helper roots.
     let cells = 1usize << ll.log_cells;
-    let mut table = vec![Sb::ZERO; cells];
+    let mut table = SecretScratch::from(vec![Sb::ZERO; cells]);
     for (i, value) in h.iter().enumerate() {
-        for j in 0..4 {
+        for j in 0..LIMBS {
             table[ll.limb_block(j) + i] = value.limb(j);
         }
     }
@@ -623,42 +652,39 @@ fn lookup_front<T: Transport>(
     for slot in &mut table[cells - ll.blind_cells..] {
         *slot = e.random()?;
     }
-    let (root, state) = commit_shares(e, &table, &ll.schedule, &mut |_| {});
-    let roots = exchange_roots(e, &root)?;
-    tr.absorb(
-        b"ZKHEM_LK_ROOT",
-        &LookupRoots::Split(&roots).transcript_bytes(),
-    );
+    let state = commit_shares(e, profile, ll.log_cells, &table, &ll.schedule, &mut |_| {});
+    let (helper_tree_nonces, helper_roots) = exchange_roots(
+        e,
+        &state.tree_nonce(),
+        &state.root(),
+    )?;
+    absorb_lookup_roots(tr, &helper_tree_nonces, &helper_roots);
 
-    // The masked sumcheck.
-    let tau: Vec<E> = (0..d).map(|_| tr.squeeze_ext4(b"ZKHEM_LK_TAU")).collect();
-    let lambda = tr.squeeze_ext4(b"ZKHEM_LK_BATCH");
+    let tau: Vec<E> = (0..d).map(|_| tr.squeeze_fp5(b"LK_TAU")).collect();
+    let lambda = tr.squeeze_fp5(b"LK_BATCH");
     e.check()?;
-    let mask_sum = e.open_ext(&[mask.sum()])?[0];
-    tr.absorb_ext4(b"ZKHEM_LK_MASK_SUM", mask_sum);
-    let rho = NonzeroChallenge::squeeze(tr, b"ZKHEM_LK_RHO").get();
-    let mut eq = build_eq_table_ext4(&tau);
-    // The selector of the constrained entries: one below `count`, `boundary` at it.
+    let mask_sum = e.open_ext(&SecretBuffer([mask.sum()])[..])?[0];
+    tr.absorb_fp5_slice(b"LK_MASK_SUM", &[mask_sum]);
+    let rho = tr.squeeze_fp5_nonzero(b"LK_RHO");
+    let mut eq = eq_table(&tau);
     let (mut count, mut boundary) = (checked, E::ZERO);
     let mut rounds = Vec::with_capacity(d);
     let mut point: Vec<E> = Vec::with_capacity(d);
-    // The running claim; the lookup sum is claimed to be zero.
-    let mut claim = Sh::ZERO;
+    let mut claim = SecretBuffer(Sh::ZERO);
     for round in 0..d {
         let live = lookup_live_pairs(lookups, round);
-        let mut xs = Vec::with_capacity(3 * live);
-        let mut ys = Vec::with_capacity(3 * live);
+        let mut xs = SecretScratch::with_capacity(3 * live);
+        let mut ys = SecretScratch::with_capacity(3 * live);
         for k in 0..live {
             xs.extend([h[2 * k], h[2 * k + 1], h[2 * k + 1] - h[2 * k]]);
             ys.extend([v[2 * k], v[2 * k + 1], v[2 * k + 1] - v[2 * k]]);
         }
-        let products = e.mul_ext(&xs, &ys)?;
-        let mut pending = vec![Sh::ZERO; LOOKUP_DEGREE + 1];
+        let products = SecretScratch::from(e.mul_ext(&xs, &ys)?);
+        let mut pending = SecretScratch::from(vec![Sh::ZERO; LOOKUP_DEGREE + 1]);
         for k in 0..live {
             let [q0, q_one, q2] = [products[3 * k], products[3 * k + 1], products[3 * k + 2]];
             let (h0, dh) = (h[2 * k], h[2 * k + 1] - h[2 * k]);
             let (n0, dn) = (n[2 * k], n[2 * k + 1] - n[2 * k]);
-            // `h (alpha - v) - n` on the line through the pair.
             let inner = [
                 h0.scale(alpha) - q0 - n0,
                 dh.scale(alpha) - (q_one - q0 - q2) - dn,
@@ -678,25 +704,18 @@ fn lookup_front<T: Transport>(
                 *slot += term;
             }
         }
-        // The linear coefficient is taken from the running claim, `p(0) + p(1) = claim`, as
-        // the row sumcheck takes its middle coefficient. For fractions that cancel it is
-        // the computed one. For fractions that do not, the opened polynomial stays masked
-        // and consistent, and the defect moves to the helper table's linear claim, which
-        // only the zero test sees; opening the computed one would release the sum of the
-        // fractions.
-        pending[1] = claim - pending[0] - pending[0] - pending[2] - pending[3] - pending[4];
-        let share = masked(&pending, mask.round_poly(&point), rho);
+        pending[1] = *claim - pending[0] - pending[0] - pending[2] - pending[3] - pending[4];
+        let share = masked(&pending[..], mask.round_poly(&point), rho);
         e.check()?;
         let poly = e.open_ext(&share)?;
-        tr.absorb_ext4_slice(b"ZKHEM_LK_ROUND", &poly);
-        let c = tr.squeeze_ext4(b"ZKHEM_LK_ROUND");
-        claim = eval_poly(&pending, c);
+        tr.absorb_fp5_slice(b"LK_ROUND", &poly);
+        let c = tr.squeeze_fp5(b"LK_ROUND");
+        *claim = eval_poly_sh(&pending[..], c);
         for shares in [&mut n, &mut v, &mut h] {
             let half = shares.len() / 2;
             for k in 0..half {
                 shares[k] = shares[2 * k] + (shares[2 * k + 1] - shares[2 * k]).scale(c);
             }
-            dregg_sig_asm::volatile_fill(&mut shares[half..], Sh::ZERO);
             shares.truncate(half);
         }
         eq = eq
@@ -712,16 +731,17 @@ fn lookup_front<T: Transport>(
         rounds.push(poly);
         point.push(c);
     }
-    e.check()?;
-    let opened = e.open_ext(&[n[0], v[0], h[0]])?;
     if !lookup_masks_full_rank(lookups, &point) {
         return Err(ProveError::MaskRankDeficient);
     }
+    e.check()?;
+    let opened = e.open_ext(&SecretBuffer([n[0], v[0], h[0]])[..])?;
     let values = [opened[0], opened[1], opened[2]];
-    tr.absorb_ext4_slice(b"ZKHEM_LK_VALUES", &values);
+    tr.absorb_fp5_slice(b"LK_VALUES", &values);
     Ok(LookupOutput {
         gamma,
-        roots,
+        helper_tree_nonces,
+        helper_roots,
         state,
         table,
         mask_sum,
@@ -731,231 +751,253 @@ fn lookup_front<T: Transport>(
     })
 }
 
-/// Commit to the value part of table shares and to four companion tables known to this
-/// custodian only.
-fn commit_shares<T: Transport>(
+/// Fold one WHIR Stage-0 step on authenticated shares (`0` Beaver triples).
+#[allow(clippy::type_complexity)]
+fn prove_stage0_fold_shared<T: Transport>(
     e: &mut Engine<T>,
-    table: &[Sb],
-    schedule: &WhirSchedule,
-    fault: &mut dyn FnMut(Fault<'_>),
-) -> (CanopyCommitment, HemWhirProverState) {
-    let mut polys: Vec<Vec<F>> = Vec::with_capacity(1 + COMPANIONS);
-    polys.push(table.iter().map(|s| s.v).collect());
-    fault(Fault::Table(&mut polys[0]));
-    for _ in 0..COMPANIONS {
-        polys.push((0..table.len()).map(|_| e.local_base()).collect());
-    }
-    let mut salt_seed = [0u8; 32];
-    for chunk in salt_seed.chunks_mut(8) {
-        chunk.copy_from_slice(&e.local_base().to_le_bytes());
-    }
-    let committed = whir_commit_batch_secret_with_schedule(polys, &salt_seed, schedule);
-    dregg_sig_asm::volatile_fill(&mut salt_seed, 0u8);
-    committed
-}
-
-/// Broadcast this custodian's root and collect every custodian's.
-fn exchange_roots<T: Transport>(
-    e: &mut Engine<T>,
-    root: &CanopyCommitment,
-) -> Result<Vec<CanopyCommitment>, ProveError> {
-    let mut roots = Vec::with_capacity(e.parties());
-    for (from, bytes) in e.exchange(root.to_bytes().to_vec())?.iter().enumerate() {
-        let (peer_root, used) = CanopyCommitment::from_bytes_canonical(bytes)
-            .ok_or(ProveError::BadPeerMessage { from })?;
-        if used != bytes.len() {
-            return Err(ProveError::BadPeerMessage { from });
+    poly_base: Option<&[Sb]>,
+    poly_ext: &[Sh],
+    st: &mut pcs::Folding,
+    tr: &mut Transcript,
+) -> Result<(SecretScratch<Sh>, [E; 5], [E; 3]), ProveError> {
+    let m = poly_base.map_or(poly_ext.len(), <[Sb]>::len);
+    assert_eq!(st.kernel.len(), m);
+    let half = m.div_ceil(2);
+    let tail = pcs::point_tail(&st.points, m, 3);
+    let k_at = |i: usize| if i < m { st.kernel[i] } else { tail[i - m] };
+    let p_at = |i: usize| -> Sh {
+        match poly_base {
+            Some(b) => b.get(i).map_or(Sh::ZERO, |s| s.lift()),
+            None => poly_ext.get(i).copied().unwrap_or(Sh::ZERO),
         }
-        roots.push(peer_root);
-    }
-    Ok(roots)
-}
+    };
 
-/// The functional `sum_t weight_t W(point_t)` on monomial coefficients (`kernel`) and on
-/// hypercube values (`dual`, the transpose of the monomial transform).
-fn kernel_and_dual(terms: &[WeightedPoint], log_cells: usize) -> (Vec<E>, Vec<E>) {
-    let cells = 1usize << log_cells;
-    let kernel = claim_kernel(terms, cells);
-    let mut dual = kernel[..cells].to_vec();
-    for b in 0..log_cells {
-        for idx in 0..cells {
-            if (idx >> b) & 1 == 0 {
-                let upper = dual[idx | (1 << b)];
-                dual[idx] -= upper;
-            }
+    let mut sigma_even = SecretBuffer(Sh::ZERO);
+    let mut tau_01 = SecretBuffer(Sh::ZERO);
+    let mut tau_10 = SecretBuffer(Sh::ZERO);
+    for n in 0..half {
+        let (f, g) = (p_at(2 * n), p_at(2 * n + 1));
+        let (ke, ko) = (k_at(2 * n), k_at(2 * n + 1));
+        *sigma_even += f.scale(ke);
+        *tau_01 += f.scale(ko);
+        *tau_10 += g.scale(ke);
+    }
+    e.check()?;
+    let fold_a = e.open_ext(&SecretBuffer([*sigma_even, *tau_01, *tau_10])[..])?;
+    tr.absorb_fp5_slice(b"FOLD_A", &fold_a);
+    let phi = tr.squeeze_fp5(b"FOLD_PHI");
+    let xs: Vec<E> = st.points[..MASK_POINTS].iter().map(|p| p.1).collect();
+    if !pcs::fold_challenge_good(phi, &xs) {
+        return Err(ProveError::MaskRankDeficient);
+    }
+
+    let mut v = vec![E::ZERO; half + 1];
+    for (n, slot) in v.iter_mut().enumerate() {
+        *slot = k_at(2 * n) + phi * k_at(2 * n + 1);
+    }
+    let (mut c_f, mut c_g) = (SecretBuffer(Sh::ZERO), SecretBuffer(Sh::ZERO));
+    for n in 0..half {
+        *c_f += p_at(2 * n).scale(v[n + 1]);
+        *c_g += p_at(2 * n + 1).scale(v[n + 1]);
+    }
+    e.check()?;
+    let fold_b = e.open_ext(&SecretBuffer([*c_f, *c_g])[..])?;
+    tr.absorb_fp5_slice(b"FOLD_B", &fold_b);
+    let chals = [
+        tr.squeeze_fp5(b"FOLD_THETA"),
+        tr.squeeze_fp5(b"FOLD_ALPHA"),
+        tr.squeeze_fp5(b"FOLD_BETA"),
+    ];
+    let [theta, alpha, beta] = chals;
+    let wire = [fold_a[0], fold_a[1], fold_a[2], fold_b[0], fold_b[1]];
+
+    let h_at = |n: usize| p_at(2 * n) + p_at(2 * n + 1).scale(theta);
+    let mut next = SecretScratch::from(vec![Sh::ZERO; half + 1]);
+    for (n, slot) in next.iter_mut().enumerate() {
+        let mut acc = Sh::ZERO;
+        if n < half {
+            acc = p_at(2 * n + 1) + h_at(n).scale(alpha);
         }
+        if n > 0 {
+            acc += h_at(n - 1).scale(beta);
+        }
+        *slot = acc;
     }
-    (kernel, dual)
+
+    st.claim = pcs::next_claim(&wire, st.claim, phi, chals);
+    st.kernel = v;
+    pcs::fold_points(&mut st.points, phi);
+    Ok((next, wire, chals))
 }
 
-/// Steps 5 and 6 for one committed table whose linear claim has passed the zero test:
-/// companion claims, the blended word, WHIR on it with every custodian's Stage-0 leaves.
+/// Open one committed table whose linear claim has already passed the SPDZ zero test.
 #[allow(clippy::too_many_arguments)]
 fn open_table<T: Transport>(
     e: &mut Engine<T>,
-    tr: &mut dregg_sig_agg::FiatShamirTranscript<dregg_sig_agg::InstanceBound>,
-    roots: &[CanopyCommitment],
+    profile: Profile,
+    tr: &mut Transcript,
+    tree_nonces: &[[u8; TREE_NONCE_BYTES]],
+    roots: &[Digest],
     log_cells: usize,
-    schedule: &WhirSchedule,
-    state: &HemWhirProverState,
-    (kernel, dual): (Vec<E>, Vec<E>),
+    schedule: &Schedule,
+    state: &Committed,
+    mut table: SecretScratch<Sb>,
+    mut kernel: Vec<E>,
     value: E,
     fault: &mut dyn FnMut(Fault<'_>),
-) -> Result<([E; COMPANIONS], HemWhirSplitOpeningProof), ProveError> {
-    let (parties, cells) = (e.parties(), 1usize << log_cells);
-    let mut payload = Vec::with_capacity(32 * COMPANIONS);
-    for companion in &state.hypercube_evals[1..] {
-        let sigma = companion
+) -> Result<SplitOpening, ProveError> {
+    let parties = e.parties();
+    let dims = pcs::stage_dims(log_cells, schedule).ok_or(ProveError::Unsupported)?;
+    let d0 = &dims[0];
+    let step_vars = d0.step_vars;
+
+    // Monomial coefficients on authenticated shares (`0` communication, `0` triples).
+    hypercube_to_monomial_sb(&mut table);
+
+    let omegas: [E; MASK_POINTS] = core::array::from_fn(|_| tr.squeeze_fp5(b"MASK_POINT"));
+    if !pcs::mask_points_good(&omegas, step_vars) {
+        return Err(ProveError::MaskRankDeficient);
+    }
+    let eval_shares = SecretBuffer(core::array::from_fn::<_, MASK_POINTS, _>(|j| {
+        let x = omegas[j];
+        table
             .iter()
-            .zip(&dual)
-            .fold(E::ZERO, |acc, (&c, &k)| acc + k.mul_base(c));
-        payload.extend_from_slice(&sigma.to_le_bytes());
+            .rev()
+            .fold(Sh::ZERO, |acc, &c| acc.scale(x) + c.lift())
+    }));
+    e.check()?;
+    let opened_evals = e.open_ext(&eval_shares[..])?;
+    let mask_evals: [E; MASK_POINTS] = opened_evals.try_into().unwrap();
+    tr.absorb_fp5_slice(b"MASK_EVAL", &mask_evals);
+    let weights: [E; MASK_POINTS] = core::array::from_fn(|_| tr.squeeze_fp5(b"MASK_WEIGHT"));
+    if weights.iter().any(|w| w.is_zero()) {
+        return Err(ProveError::MaskRankDeficient);
     }
-    let mut companion_claims = [E::ZERO; COMPANIONS];
-    for (from, bytes) in e.exchange(payload)?.iter().enumerate() {
-        if bytes.len() != 32 * COMPANIONS {
+
+    let point_terms: Vec<(E, E)> = weights.into_iter().zip(omegas).collect();
+    pcs::add_points(&mut kernel, &point_terms);
+    let mut fold_st = pcs::Folding {
+        kernel,
+        claim: mask_evals
+            .iter()
+            .zip(&weights)
+            .fold(value, |acc, (&a, &w)| acc + w * a),
+        points: point_terms,
+    };
+
+    let mut stage0_folds = Vec::with_capacity(step_vars);
+    let mut prev_chals = Vec::with_capacity(step_vars);
+    let (mut poly_sh, wire0, c0) =
+        prove_stage0_fold_shared(e, Some(&table), &[], &mut fold_st, tr)?;
+    drop(table);
+    stage0_folds.push(wire0);
+    prev_chals.push(c0);
+    for _ in 1..step_vars {
+        let (next, wire, c) = prove_stage0_fold_shared(e, None, &poly_sh, &mut fold_st, tr)?;
+        poly_sh = next;
+        stage0_folds.push(wire);
+        prev_chals.push(c);
+    }
+
+    // Settle all pending MACs before broadcasting unauthenticated Stage-0 mask claim & reduced word!
+    e.check()?;
+
+    pcs::extend_kernel(&mut fold_st.kernel, &fold_st.points, state.mask().len());
+    let own_mask_claim = state
+        .mask()
+        .iter()
+        .zip(&fold_st.kernel)
+        .fold(E::ZERO, |acc, (&r, &k)| acc + r * k);
+    let mut mask_claim = E::ZERO;
+    for (from, bytes) in e.exchange_guarded(own_mask_claim.to_le_bytes().to_vec())?.iter().enumerate() {
+        let chunk: [u8; EXT_BYTES] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProveError::BadPeerMessage { from })?;
+        mask_claim += E::from_le_bytes_canonical(chunk)
+            .ok_or(ProveError::BadPeerMessage { from })?;
+    }
+    tr.absorb_fp5_slice(b"MASK_CLAIM", &[mask_claim]);
+    let beta_r = tr.squeeze_fp5_nonzero(b"MASK_BETA");
+    fold_st.claim += beta_r * mask_claim;
+
+    let mask_len = state.mask().len();
+    let mut word_payload = Vec::with_capacity(EXT_BYTES * mask_len);
+    for n in 0..mask_len {
+        let u = poly_sh.get(n).map_or(E::ZERO, |s| s.v) + beta_r * state.mask()[n];
+        word_payload.extend_from_slice(&u.to_le_bytes());
+    }
+    drop(poly_sh);
+    fault(Fault::Word(&mut word_payload));
+    let mut g = vec![E::ZERO; mask_len];
+    for (from, bytes) in e.exchange_guarded(word_payload)?.iter().enumerate() {
+        if bytes.len() != EXT_BYTES * mask_len {
             return Err(ProveError::BadPeerMessage { from });
         }
-        for (claim, chunk) in companion_claims.iter_mut().zip(bytes.chunks_exact(32)) {
-            *claim += chunk
-                .try_into()
-                .ok()
-                .and_then(E::from_le_bytes_canonical)
-                .ok_or(ProveError::BadPeerMessage { from })?;
-        }
-    }
-    let (scalars, claim) = blend_claim(tr, value, &companion_claims);
-    let mut payload = Vec::with_capacity(32 * cells);
-    for x in 0..cells {
-        let mut u = E::ZERO;
-        for (evals, &s) in state.hypercube_evals.iter().zip(&scalars) {
-            u += s.mul_base(evals[x]);
-        }
-        payload.extend_from_slice(&u.to_le_bytes());
-    }
-    fault(Fault::Word(&mut payload));
-    let mut word = vec![E::ZERO; cells];
-    for (from, bytes) in e.exchange(payload)?.iter().enumerate() {
-        if bytes.len() != 32 * cells {
-            return Err(ProveError::BadPeerMessage { from });
-        }
-        for (u, chunk) in word.iter_mut().zip(bytes.chunks_exact(32)) {
-            *u += chunk
-                .try_into()
-                .ok()
-                .and_then(E::from_le_bytes_canonical)
+        for (slot, chunk) in g.iter_mut().zip(bytes.chunks_exact(EXT_BYTES)) {
+            let arr: [u8; EXT_BYTES] = chunk.try_into().unwrap();
+            *slot += E::from_le_bytes_canonical(arr)
                 .ok_or(ProveError::BadPeerMessage { from })?;
         }
     }
 
-    // WHIR on the public word; every custodian opens its own Stage-0 leaves.
     let mut failure: Option<ProveError> = None;
-    let opening = whir_open_blend_split(
-        roots,
+    let opening = pcs::open_from_reduced_split(
+        profile,
         log_cells,
         schedule,
-        &scalars,
-        hypercube_to_monomial_coeffs_ext4(&word),
-        kernel,
-        claim,
+        tree_nonces,
+        roots,
+        mask_evals,
+        stage0_folds,
+        mask_claim,
+        g,
+        fold_st,
+        prev_chals,
+        beta_r,
         tr,
-        &mut |fibers| {
-            let mut own = whir_stage0_open_share(state, fibers);
+        &mut |idx| {
+            let mut own = pcs::stage0_answer(state, idx);
             fault(Fault::Leaves(&mut own));
-            let mut all = Vec::with_capacity(parties);
-            match e.exchange(encode_opening(&own)) {
+            let mut encoded = Vec::new();
+            pcs::push_stage0_query(&mut encoded, &own);
+            match e.exchange_guarded(encoded) {
                 Ok(messages) => {
+                    let mut all = Vec::with_capacity(parties);
                     for (from, bytes) in messages.iter().enumerate() {
-                        match decode_opening(bytes) {
-                            Some(opening) => all.push(opening),
+                        match pcs::read_stage0_query_exact(bytes, d0) {
+                            Some(q) => all.push(q),
                             None => {
                                 failure.get_or_insert(ProveError::BadPeerMessage { from });
+                                return None;
                             }
                         }
                     }
+                    Some(all)
                 }
                 Err(err) => {
                     failure.get_or_insert(err.into());
+                    None
                 }
             }
-            // Keep the shape; a run with `failure` set is discarded below.
-            while all.len() < parties {
-                all.push(Stage0ShareOpening {
-                    salts: Vec::new(),
-                    vals: Vec::new(),
-                    multiproof: own.multiproof.clone(),
-                });
-            }
-            all
         },
     );
     if let Some(err) = failure {
         return Err(err);
     }
-    // A custodian whose leaves do not open its own root.
-    let opening = opening.map_err(|_| ProveError::Rejected)?;
-    Ok((companion_claims, opening))
+    opening.ok_or(ProveError::Rejected)
 }
 
-fn encode_opening(opening: &Stage0ShareOpening) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(opening.salts.len() as u32).to_le_bytes());
-    for salt in &opening.salts {
-        out.extend_from_slice(salt);
-    }
-    out.extend_from_slice(&(opening.vals.len() as u32).to_le_bytes());
-    for v in &opening.vals {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    opening.multiproof.push_bytes(&mut out);
-    out
-}
-
-fn decode_opening(bytes: &[u8]) -> Option<Stage0ShareOpening> {
-    let count = |pos: &mut usize| -> Option<usize> {
-        let n = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
-        *pos += 4;
-        Some(n)
-    };
-    let mut pos = 0;
-    let n_salts = count(&mut pos)?;
-    let salts = bytes
-        .get(pos..pos.checked_add(n_salts.checked_mul(16)?)?)?
-        .chunks_exact(16)
-        .map(|c| c.try_into().ok())
-        .collect::<Option<Vec<[u8; 16]>>>()?;
-    pos += 16 * n_salts;
-    let n_vals = count(&mut pos)?;
-    let vals = bytes
-        .get(pos..pos.checked_add(n_vals.checked_mul(8)?)?)?
-        .chunks_exact(8)
-        .map(|c| F::from_canonical_u64(u64::from_le_bytes(c.try_into().ok()?)))
-        .collect::<Option<Vec<F>>>()?;
-    pos += 8 * n_vals;
-    let (multiproof, used) = CanopyMultiProof::from_bytes_canonical(bytes.get(pos..)?)?;
-    (pos + used == bytes.len()).then_some(Stage0ShareOpening {
-        salts,
-        vals,
-        multiproof,
-    })
-}
-
-/// Prove that the shared assignment satisfies `shape`, bound to `statement`.
-///
-/// `z` holds this custodian's authenticated shares of the assignment, one per variable.
-/// The constant, the public inputs and the masking variables are overwritten here: the
-/// first two with shares of the public values, the last with uniform values no custodian
-/// knows. On `Err` no proof exists and the run must not be continued; see [`ProveError`]
-/// for what each failure means.
+/// Prove that the shared assignment satisfies `shape`, bound to `statement`, under `profile`.
 pub fn prove_party<T: Transport>(
     e: &mut Engine<T>,
     shape: &Shape,
     public_inputs: &[F],
     statement: &[u8],
-    regime: WhirSecurityRegime,
+    profile: Profile,
     z: Vec<Sb>,
-) -> Result<ZkHemSplitProof, ProveError> {
-    prove_party_with_fault(e, shape, public_inputs, statement, regime, z, &mut |_| {})
+) -> Result<ZkHemV2SplitProof, ProveError> {
+    prove_party_with_fault(e, shape, public_inputs, statement, profile, z, &mut |_| {})
 }
 
 /// [`prove_party`] with a hook at each [`Fault`] point.
@@ -964,24 +1006,43 @@ pub fn prove_party_with_fault<T: Transport>(
     shape: &Shape,
     public_inputs: &[F],
     statement: &[u8],
-    regime: WhirSecurityRegime,
-    mut z: Vec<Sb>,
+    profile: Profile,
+    z: Vec<Sb>,
     fault: &mut dyn FnMut(Fault<'_>),
-) -> Result<ZkHemSplitProof, ProveError> {
-    let (me, parties) = (e.me(), e.parties());
+) -> Result<ZkHemV2SplitProof, ProveError> {
+    let mut z = SecretScratch::from(z);
+    let parties = e.parties();
     if shape.num_sbox != 0 {
         return Err(ProveError::SboxRows);
     }
-    let layout = Layout::new(shape, regime).ok_or(ProveError::Unsupported)?;
-    if parties > MAX_SPLIT_COMMITTERS {
+    let layout = layout_of(shape).ok_or(ProveError::Unsupported)?;
+    if !(1..=MAX_STAGE0_SHARES).contains(&parties) {
         return Err(ProveError::Unsupported);
     }
     if z.len() != shape.num_vars || public_inputs.len() != shape.num_public {
         return Err(ProveError::Malformed);
     }
+    let res = prove_party_validated(e, shape, &layout, public_inputs, statement, profile, &mut z, fault);
+    if res.is_err() {
+        e.poison();
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_party_validated<T: Transport>(
+    e: &mut Engine<T>,
+    shape: &Shape,
+    layout: &dregg_sig_agg::zk_hem::v2::params::Layout,
+    public_inputs: &[F],
+    statement: &[u8],
+    profile: Profile,
+    z: &mut SecretScratch<Sb>,
+    fault: &mut dyn FnMut(Fault<'_>),
+) -> Result<ZkHemV2SplitProof, ProveError> {
+    let me = e.me();
     let cells = 1usize << layout.log_cells;
 
-    // The committed table: variables, masks, blinders.
     z[0] = e.public(F::ONE);
     for (slot, &value) in z[1..].iter_mut().zip(public_inputs) {
         *slot = e.public(value);
@@ -989,7 +1050,7 @@ pub fn prove_party_with_fault<T: Transport>(
     for slot in &mut z[shape.mask_var_base..] {
         *slot = e.random()?;
     }
-    let mut table = vec![Sb::ZERO; cells];
+    let mut table = SecretScratch::from(vec![Sb::ZERO; cells]);
     let row_mask = sample_mask(
         e,
         &mut table,
@@ -1006,11 +1067,11 @@ pub fn prove_party_with_fault<T: Transport>(
         COL_MASK_BITS,
         |i, j| layout.col_mask_block(shape.log_rows, i, j),
     )?;
-    table[..shape.num_vars].copy_from_slice(&z);
+    table[..shape.num_vars].copy_from_slice(z);
     for slot in &mut table[cells - layout.blind_cells..] {
         *slot = e.random()?;
     }
-    let row_base: [Vec<Sb>; 3] = [&shape.a, &shape.b, &shape.c].map(|matrix| {
+    let row_base: [SecretScratch<Sb>; 3] = [&shape.a, &shape.b, &shape.c].map(|matrix| {
         (0..shape.num_rows())
             .map(|i| {
                 matrix
@@ -1019,43 +1080,57 @@ pub fn prove_party_with_fault<T: Transport>(
             })
             .collect()
     });
-    dregg_sig_asm::volatile_fill(&mut z, Sb::ZERO);
+    z.clear();
 
-    let (root, state) = commit_shares(e, &table, &layout.schedule, fault);
-    let roots = exchange_roots(e, &root)?;
+    let state = commit_shares(
+        e,
+        profile,
+        layout.log_cells,
+        &table,
+        &layout.schedule,
+        fault,
+    );
+    let (tree_nonces, roots) = exchange_roots(
+        e,
+        &state.tree_nonce(),
+        &state.root(),
+    )?;
 
-    // Steps 1 to 3.
-    let mut tr = split_transcript(shape, &layout, statement, public_inputs, &roots);
-    let lookup = match (shape.lookups(), &layout.lookup) {
+    let mut tr = split_transcript(
+        profile,
+        shape,
+        &layout,
+        statement,
+        public_inputs,
+        &tree_nonces,
+        &roots,
+    );
+    let mut lookup = match (shape.lookups(), &layout.lookup) {
         (Some(lookups), Some(ll)) => Some((
             lookups,
             ll,
-            lookup_front(e, &mut tr, lookups, ll, &table[..shape.num_vars])?,
+            lookup_front(e, profile, &mut tr, lookups, ll, &table[..shape.num_vars])?,
         )),
         _ => None,
     };
     let tau: Vec<E> = (0..shape.log_rows)
-        .map(|_| tr.squeeze_ext4(b"ZKHEM_TAU"))
+        .map(|_| tr.squeeze_fp5(b"TAU"))
         .collect();
-    let row = row_sumcheck(e, &mut tr, &tau, row_base, &row_mask, fault)?;
-    if !mask_rows_full_rank(shape, &row.point) {
-        return Err(ProveError::MaskRankDeficient);
-    }
-    tr.absorb_ext4_slice(b"ZKHEM_ROW_VALUES", &row.values);
+    let row = row_sumcheck(e, shape, &mut tr, &tau, row_base, &row_mask, fault)?;
+    tr.absorb_fp5_slice(b"ROW_VALUES", &row.values);
     let combine: Vec<E> = (0..if lookup.is_some() { 5 } else { 3 })
-        .map(|_| tr.squeeze_ext4(b"ZKHEM_COMBINE"))
+        .map(|_| tr.squeeze_fp5(b"COMBINE"))
         .collect();
-    let mut matrix = column_matrix(
-        shape,
-        &build_eq_table_ext4(&row.point),
-        &combine[..3],
-        1 << layout.var_bits,
-    );
+    let var_cube = 1usize << layout.var_bits;
+    let mut z_var = SecretScratch::from(vec![Sb::ZERO; var_cube]);
+    let live = layout.var_cells.min(var_cube);
+    z_var[..live].copy_from_slice(&table[..live]);
+    let mut matrix = column_table(shape, &eq_table(&row.point), &combine[..3], var_cube);
     if let Some((lookups, _, out)) = &lookup {
         lookup_column_add(
             &mut matrix,
             lookups,
-            &build_eq_table_ext4(&out.point),
+            &eq_table(&out.point),
             [combine[3], combine[4]],
             out.gamma,
         );
@@ -1064,119 +1139,132 @@ pub fn prove_party_with_fault<T: Transport>(
         e,
         &mut tr,
         matrix,
-        &table[..1 << layout.var_bits],
+        &z_var,
         &col_mask,
     )?;
+    drop(z_var);
 
-    // Step 4, by the verifier's own replay of the messages sent so far.
-    let mut tr = split_transcript(shape, &layout, statement, public_inputs, &roots);
+    // Verifier front-end replay to obtain the exact cell weights & claimed values.
+    let mut tr = split_transcript(
+        profile,
+        shape,
+        &layout,
+        statement,
+        public_inputs,
+        &tree_nonces,
+        &roots,
+    );
     let front = replay_front(
         shape,
         &layout,
         public_inputs,
         &mut tr,
         &FrontMessages {
+            lookup: lookup.as_ref().map(|(_, _, out)| LookupMessages {
+                helper_tree_nonces: &out.helper_tree_nonces,
+                helper_roots: &out.helper_roots,
+                mask_sum: out.mask_sum,
+                rounds: &out.rounds,
+                values: out.values,
+            }),
             row_mask_sum: row.mask_sum,
             row_rounds: &row.rounds,
             row_values: row.values,
             col_mask_sum,
             col_rounds: &col_rounds,
-            lookup: lookup.as_ref().map(|(_, _, out)| LookupMessages {
-                roots: LookupRoots::Split(&out.roots),
-                mask_sum: out.mask_sum,
-                rounds: &out.rounds,
-                values: out.values,
-            }),
         },
+        true,
     )
     .ok_or(ProveError::Rejected)?;
-    let (kernel, dual) = kernel_and_dual(&front.terms, layout.log_cells);
-    let helper = match (&lookup, &front.lookup) {
-        (Some((_, ll, out)), Some(claim)) => Some((
-            *ll,
-            out,
-            kernel_and_dual(&claim.terms, ll.log_cells),
-            claim.value,
-        )),
-        (None, None) => None,
-        _ => return Err(ProveError::Rejected),
-    };
 
-    // The linear claims must hold on the authenticated tables before anything that depends
-    // on them is opened: `rho * (<Z, K> - V)` for a uniform shared `rho` is zero or uniform.
-    let gap_of = |e: &Engine<T>, table: &[Sb], dual: &[E], value: E| {
-        table
-            .iter()
-            .zip(dual)
-            .fold(Sh::ZERO, |acc, (s, &k)| acc + s.scale_ext(k))
+    // SPDZ zero test before opening anything that depends on the linear claims:
+    // `rho * (<Z, weights> - V)` for a fresh uniform shared `rho` is 0 iff satisfied.
+    let gap_of = |e: &Engine<T>, tbl: &[Sb], weights: &[E], value: E| {
+        tbl.iter()
+            .zip(weights)
+            .fold(Sh::ZERO, |acc, (s, &w)| acc + s.scale_ext(w))
             - e.public_ext(value)
     };
-    let mut gaps = vec![gap_of(e, &table, &dual, front.value)];
-    if let Some((_, out, (_, helper_dual), value)) = &helper {
-        gaps.push(gap_of(e, &out.table, helper_dual, *value));
+    let mut gaps = SecretScratch::with_capacity(2);
+    gaps.push(gap_of(e, &table, &front.cell_weights, front.value));
+    if let (Some((_, _, out)), Some(hc)) = (&lookup, &front.helper) {
+        gaps.push(gap_of(e, &out.table, &hc.cell_weights, hc.value));
+    } else if lookup.is_some() != front.helper.is_some() {
+        return Err(ProveError::Rejected);
     }
-    let mut blinds = Vec::with_capacity(gaps.len());
+    let mut blinds = SecretScratch::with_capacity(gaps.len());
     for _ in &gaps {
         blinds.push(e.random_ext()?);
     }
-    let test = e.mul_ext(&gaps, &blinds)?;
+    let test = SecretScratch::from(e.mul_ext(&gaps, &blinds)?);
     e.check()?;
     let verdict = e.open_ext(&test)?;
     e.check()?;
     if verdict.iter().any(|v| !v.is_zero()) {
         return Err(ProveError::Unsatisfied);
     }
-    dregg_sig_asm::volatile_fill(&mut table, Sb::ZERO);
 
-    // Steps 5 and 6, for the assignment table and then for the helper table.
-    let (companion_claims, opening) = open_table(
+    let kernel = cell_weights_to_kernel(front.cell_weights, cells);
+    let opening = open_table(
         e,
+        profile,
         &mut tr,
+        &tree_nonces,
         &roots,
         layout.log_cells,
         &layout.schedule,
         &state,
-        (kernel, dual),
+        table,
+        kernel,
         front.value,
         fault,
     )?;
-    let lookup_proof = match helper {
-        None => None,
-        Some((ll, out, functional, value)) => {
-            let (companion_claims, opening) = open_table(
+
+    let lookup_proof = match (lookup.take(), front.helper) {
+        (None, None) => None,
+        (Some((_, ll, out)), Some(hc)) => {
+            let h_kernel = cell_weights_to_kernel(hc.cell_weights, 1 << ll.log_cells);
+            let h_opening = open_table(
                 e,
+                profile,
                 &mut tr,
-                &out.roots,
+                &out.helper_tree_nonces,
+                &out.helper_roots,
                 ll.log_cells,
                 &ll.schedule,
                 &out.state,
-                functional,
-                value,
+                out.table,
+                h_kernel,
+                hc.value,
                 fault,
             )?;
-            Some(SplitLookupProof {
-                roots: out.roots.clone(),
+            Some(SplitLookupV2Proof {
+                helper_tree_nonces: out.helper_tree_nonces,
+                helper_roots: out.helper_roots,
                 mask_sum: out.mask_sum,
-                rounds: out.rounds.clone(),
+                rounds: out.rounds,
                 values: out.values,
-                companion_claims,
-                opening,
+                opening: h_opening,
             })
         }
+        _ => return Err(ProveError::Rejected),
     };
+
     debug_assert_eq!(me, e.me());
-    let proof = ZkHemSplitProof {
+    let proof = ZkHemV2SplitProof {
+        profile,
+        log_cells: layout.log_cells as u8,
+        tree_nonces,
         roots,
+        lookup: lookup_proof,
         row_mask_sum: row.mask_sum,
         row_rounds: row.rounds,
         row_values: row.values,
         col_mask_sum,
         col_rounds,
-        companion_claims,
         opening,
-        lookup: lookup_proof,
     };
-    if !verify_split(shape, public_inputs, statement, regime, &proof) {
+    if !verify_split(shape, public_inputs, statement, profile, &proof) {
         return Err(ProveError::Rejected);
     }
     Ok(proof)
@@ -1184,6 +1272,8 @@ pub fn prove_party_with_fault<T: Transport>(
 
 #[cfg(test)]
 pub(super) mod tests {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
     use super::super::engine::tests::run_parties;
     use super::super::engine::{Dealer, Stats};
     use super::*;
@@ -1193,7 +1283,7 @@ pub(super) mod tests {
         F::from_u64_reduced(x)
     }
 
-    /// `x * y = 35`, a cube and a Boolean: multiplication rows only.
+    /// `x * y = 35`, a cube and a Boolean: multiplication rows only, closed for `v2`.
     pub(in super::super) fn small_relation(x: u64) -> (Shape, Vec<F>) {
         let mut cs = ConstraintSystem::new();
         let p = cs.public_input(f(35));
@@ -1206,12 +1296,9 @@ pub(super) mod tests {
         cs.enforce_zero(Lc::from(cube).plus_const(F::ZERO - f(125)));
         let bit: Lc = cs.alloc(f(1)).into();
         cs.enforce_boolean(&bit);
-        cs.finish()
+        cs.finish_v2()
     }
 
-    /// Test helper that holds the assignment in the clear: deal authenticated shares of
-    /// it and the preprocessing, then run every custodian. The path without a clear
-    /// assignment is `super::super::prove_ownership_party`. `tamper` may alter a custodian's shares before it starts.
     pub(in super::super) fn deal_clear_assignment_and_prove(
         shape: &Shape,
         assignment: &[F],
@@ -1220,9 +1307,20 @@ pub(super) mod tests {
         seed: u8,
         tamper: impl Fn(usize, &mut Vec<Sb>) + Sync,
         fault: impl Fn(usize, Fault<'_>) + Sync,
-    ) -> Vec<(Result<ZkHemSplitProof, ProveError>, Stats)> {
-        let regime = WhirSecurityRegime::default();
-        let mut dealer = Dealer::new(parties, &[seed; 32]);
+    ) -> Vec<(Result<ZkHemV2SplitProof, ProveError>, Stats)> {
+        static CALL_SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let profile = Profile::default();
+        let mut dseed = [seed; 32];
+        // Keep `Dealer` deterministic for equal `seed` when comparing message patterns, while
+        // re-randomizing MAC shares via `seq` only for tape_id uniqueness? Wait: `two_witness_relation`
+        // compares `(rounds, triples_used, randoms_used, mac_checks)` AND wants deterministic
+        // Fiat-Shamir coins for `seed`! If we vary `dseed[24..]` by `seq` ONLY in `preprocessing`?
+        // No: `Dealer` uses `dseed` to sample shares & triples; `Engine::new` uses `BURNED_TAPES`.
+        // Varying `dseed[24..]` by `seq` gives fresh `tape_id`s on every call while keeping exact
+        // round/triple/random/mac_check counts deterministic (`pattern(stats)` does not depend on coin values!).
+        dseed[24..].copy_from_slice(&seq.to_le_bytes());
+        let mut dealer = Dealer::new(parties, &dseed);
         let mut shares: Vec<Vec<Sb>> = (0..parties)
             .map(|_| Vec::with_capacity(assignment.len()))
             .collect();
@@ -1231,7 +1329,7 @@ pub(super) mod tests {
                 shares[p].push(s);
             }
         }
-        let (triples, randoms) = prover_demand(shape, regime).unwrap();
+        let (triples, randoms) = prover_demand(shape, profile).unwrap();
         let preps = dealer.preprocessing(triples, randoms);
         let publics = assignment[1..=shape.num_public].to_vec();
         run_parties(preps, |mut e| {
@@ -1243,7 +1341,7 @@ pub(super) mod tests {
                 shape,
                 &publics,
                 statement,
-                regime,
+                profile,
                 z,
                 &mut |point| fault(me, point),
             );
@@ -1257,7 +1355,7 @@ pub(super) mod tests {
 
     #[test]
     fn a_quorum_proves_and_the_split_verifier_accepts() {
-        let regime = WhirSecurityRegime::default();
+        let profile = Profile::default();
         let (shape, assignment) = small_relation(5);
         let publics = assignment[1..=shape.num_public].to_vec();
         for parties in [2usize, 3, 5] {
@@ -1272,29 +1370,38 @@ pub(super) mod tests {
             );
             let proof = out[0].0.clone().unwrap();
             assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
+            assert_eq!(proof.profile, profile);
             assert_eq!(proof.roots.len(), parties);
-            assert!(verify_split(&shape, &publics, b"stmt", regime, &proof));
-            assert!(!verify_split(&shape, &publics, b"other", regime, &proof));
-            assert!(!verify_split(&shape, &[f(36)], b"stmt", regime, &proof));
+            assert_eq!(proof.tree_nonces.len(), parties);
+            assert!(verify_split(&shape, &publics, b"stmt", profile, &proof));
+            assert!(!verify_split(&shape, &publics, b"other", profile, &proof));
+            assert!(!verify_split(&shape, &[f(36)], b"stmt", profile, &proof));
 
             let bytes = proof.to_bytes();
             assert_eq!(
-                ZkHemSplitProof::from_bytes(&bytes, &shape, regime).as_ref(),
+                ZkHemV2SplitProof::from_bytes(&bytes, &shape).as_ref(),
                 Some(&proof)
             );
-            assert!(
-                ZkHemSplitProof::from_bytes(&bytes[..bytes.len() - 1], &shape, regime).is_none()
-            );
+            assert!(ZkHemV2SplitProof::from_bytes(&bytes[..bytes.len() - 1], &shape).is_none());
             let mut swapped = proof.clone();
             swapped.roots.swap(0, 1);
-            assert!(!verify_split(&shape, &publics, b"stmt", regime, &swapped));
+            assert!(!verify_split(&shape, &publics, b"stmt", profile, &swapped));
+            let mut swapped_nonces = proof.clone();
+            swapped_nonces.tree_nonces.swap(0, 1);
+            assert!(!verify_split(
+                &shape,
+                &publics,
+                b"stmt",
+                profile,
+                &swapped_nonces
+            ));
             let mut wrong = proof.clone();
             wrong.row_values[0] += E::ONE;
-            assert!(!verify_split(&shape, &publics, b"stmt", regime, &wrong));
+            assert!(!verify_split(&shape, &publics, b"stmt", profile, &wrong));
         }
     }
 
-    /// Range-checked bytes, a two-column table lookup and one multiplication row.
+    /// Range-checked bytes, a two-column table lookup and one multiplication row (`v2`).
     fn lookup_relation(x: [u64; 3], square: u64) -> (Shape, Vec<F>) {
         let mut cs = ConstraintSystem::new();
         let p = cs.public_input(f(35));
@@ -1309,12 +1416,11 @@ pub(super) mod tests {
         cs.enforce_in_table(table, &[vars[0].clone(), sq]);
         let prod = cs.mul(&vars[0], &vars[1]);
         cs.enforce_equal(&prod.into(), &p.into());
-        cs.finish()
+        cs.finish_v2()
     }
 
     #[test]
     fn a_quorum_proves_a_relation_with_lookups() {
-        let regime = WhirSecurityRegime::default();
         let (shape, assignment) = lookup_relation([5, 7, 250], 25);
         assert!(shape.is_satisfied(&assignment));
         let publics = assignment[1..=shape.num_public].to_vec();
@@ -1331,47 +1437,61 @@ pub(super) mod tests {
             let proof = out[0].0.clone().unwrap();
             assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
             let lookup = proof.lookup.as_ref().unwrap();
-            assert_eq!(lookup.roots.len(), parties);
-            assert!(verify_split(&shape, &publics, b"stmt", regime, &proof));
-            assert!(!verify_split(&shape, &publics, b"other", regime, &proof));
+            assert_eq!(lookup.helper_roots.len(), parties);
+            assert_eq!(lookup.helper_tree_nonces.len(), parties);
+            assert!(verify_split(
+                &shape,
+                &publics,
+                b"stmt",
+                proof.profile,
+                &proof
+            ));
+            assert!(!verify_split(
+                &shape,
+                &publics,
+                b"other",
+                proof.profile,
+                &proof
+            ));
 
             let bytes = proof.to_bytes();
             assert_eq!(
-                ZkHemSplitProof::from_bytes(&bytes, &shape, regime).as_ref(),
+                ZkHemV2SplitProof::from_bytes(&bytes, &shape).as_ref(),
                 Some(&proof)
             );
-            assert!(
-                ZkHemSplitProof::from_bytes(&bytes[..bytes.len() - 1], &shape, regime).is_none()
-            );
-            // Every part of the lookup proof is bound.
-            type Mutation = fn(&mut SplitLookupProof);
+            assert!(ZkHemV2SplitProof::from_bytes(&bytes[..bytes.len() - 1], &shape).is_none());
+            type Mutation = fn(&mut SplitLookupV2Proof);
             let mutations: [Mutation; 9] = [
-                |l| l.roots.swap(0, 1),
-                |l| l.roots[0].root[0] ^= 1,
+                |l| l.helper_roots.swap(0, 1),
+                |l| l.helper_tree_nonces.swap(0, 1),
+                |l| l.helper_roots[0][0] ^= 1,
                 |l| l.mask_sum += E::ONE,
                 |l| l.rounds[1][3] += E::ONE,
                 |l| l.values[0] += E::ONE,
                 |l| l.values[1] += E::ONE,
                 |l| l.values[2] += E::ONE,
-                |l| l.companion_claims[2] += E::ONE,
-                |l| l.opening.shares[1].vals[0] += F::ONE,
+                |l| l.opening.stage0_shares[1].leaves[0].z[0] += F::ONE,
             ];
             for (k, mutate) in mutations.iter().enumerate() {
                 let mut bad = proof.clone();
                 mutate(bad.lookup.as_mut().unwrap());
                 assert!(
-                    !verify_split(&shape, &publics, b"stmt", regime, &bad),
+                    !verify_split(&shape, &publics, b"stmt", bad.profile, &bad),
                     "mutation {k} accepted"
                 );
             }
             let mut stripped = proof.clone();
             stripped.lookup = None;
-            assert!(!verify_split(&shape, &publics, b"stmt", regime, &stripped));
+            assert!(!verify_split(
+                &shape,
+                &publics,
+                b"stmt",
+                stripped.profile,
+                &stripped
+            ));
         }
     }
 
-    /// A looked-up value outside its table, a tuple that is not a table row and a wrong
-    /// multiplicity each stop at the zero test: the rows hold, only the helper claim fails.
     #[test]
     fn a_failed_lookup_aborts_at_the_zero_test() {
         let (shape, good) = lookup_relation([5, 7, 250], 25);
@@ -1394,8 +1514,6 @@ pub(super) mod tests {
                 );
             }
         }
-        // Same number of rounds and of consumed material as an accepted run up to the
-        // abort: the failing run stops before the companion claims.
         let ok =
             deal_clear_assignment_and_prove(&shape, &good, b"stmt", 3, 4, |_, _| {}, |_, _| {});
         let bad =
@@ -1404,12 +1522,9 @@ pub(super) mod tests {
         assert!(bad[0].1.rounds < ok[0].1.rounds);
     }
 
-    /// A custodian that commits to a helper table other than its shares makes every
-    /// custodian reject the assembled proof.
     #[test]
     fn a_wrong_helper_table_is_rejected_by_every_custodian() {
         let (shape, assignment) = lookup_relation([5, 7, 250], 25);
-        // The second blended word a custodian sends is the helper table's.
         let words_sent = core::sync::atomic::AtomicUsize::new(0);
         let out = deal_clear_assignment_and_prove(
             &shape,
@@ -1431,8 +1546,6 @@ pub(super) mod tests {
         }
     }
 
-    /// A shared assignment that does not satisfy the relation stops at the zero test in
-    /// every custodian, before the companion claims or the blended word are sent.
     #[test]
     fn an_unsatisfying_assignment_aborts_at_the_zero_test() {
         let (shape, _) = small_relation(5);
@@ -1444,8 +1557,6 @@ pub(super) mod tests {
         }
     }
 
-    /// Rounds, material and checks of a run. The byte count is left out: the size of a
-    /// Stage-0 multiproof depends on which fibers the transcript selects.
     fn pattern(stats: Stats) -> (u64, u64, u64, u64) {
         (
             stats.rounds,
@@ -1455,7 +1566,6 @@ pub(super) mod tests {
         )
     }
 
-    /// `x * y = 35` with a free Boolean: two witnesses for one statement.
     fn two_witness_relation(bit: u64) -> (Shape, Vec<F>) {
         let mut cs = ConstraintSystem::new();
         let p = cs.public_input(f(35));
@@ -1465,16 +1575,11 @@ pub(super) mod tests {
         cs.enforce_equal(&prod.into(), &p.into());
         let b: Lc = cs.alloc(f(bit)).into();
         cs.enforce_boolean(&b);
-        cs.finish()
+        cs.finish_v2()
     }
 
-    /// A malicious custodian (party 2 of 3) deviates in one place. Every honest
-    /// custodian aborts, at the same point and with the same error whichever of two
-    /// witnesses of the same statement is shared, after the same number of rounds, MAC
-    /// checks and consumed material.
     #[test]
     fn a_deviating_custodian_makes_every_honest_custodian_abort() {
-        use super::super::engine::MpcError;
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Attack {
             Table,
@@ -1518,8 +1623,10 @@ pub(super) mod tests {
                         match (attack, point) {
                             (Attack::Table, Fault::Table(table)) => table[secret] += F::ONE,
                             (Attack::RoundShare, Fault::RoundShare(share)) => share[1].v += E::ONE,
-                            (Attack::Word, Fault::Word(bytes)) => bytes[64] ^= 1,
-                            (Attack::Leaf, Fault::Leaves(leaves)) => leaves.vals[0] += F::ONE,
+                            (Attack::Word, Fault::Word(bytes)) => bytes[80] ^= 1,
+                            (Attack::Leaf, Fault::Leaves(leaves)) => {
+                                leaves.leaves[0].z[0] += F::ONE;
+                            }
                             _ => {}
                         }
                     },
@@ -1533,11 +1640,8 @@ pub(super) mod tests {
         }
     }
 
-    /// Without a deviation both witnesses give accepted proofs with the same message
-    /// pattern, and the two proofs differ (the masks do not repeat).
     #[test]
     fn two_witnesses_of_one_statement_give_the_same_message_pattern() {
-        let regime = WhirSecurityRegime::default();
         let runs: Vec<_> = [0u64, 1]
             .into_iter()
             .map(|bit| {
@@ -1552,11 +1656,58 @@ pub(super) mod tests {
                     |_, _| {},
                 );
                 let proof = out[0].0.clone().unwrap();
-                assert!(verify_split(&shape, &[f(35)], b"stmt", regime, &proof));
+                assert!(verify_split(&shape, &[f(35)], b"stmt", proof.profile, &proof));
                 (proof, pattern(out[0].1))
             })
             .collect();
         assert_eq!(runs[0].1, runs[1].1);
         assert_ne!(runs[0].0, runs[1].0);
+    }
+
+    #[test]
+    fn tooth_malformed_peer_word_poisons_collab_engine_against_reuse() {
+        // `#tooth`: Previously an unauthenticated Stage-0 `BadPeerMessage` (e.g. a peer
+        // sending a non-canonical `Fp5` limb or truncated Stage-0 `g` word after `e.exchange`)
+        // returned `Err(ProveError::BadPeerMessage)` while leaving `e.failed == false`!
+        let (shape, assignment) = small_relation(5);
+        let profile = Profile::default();
+        let (triples, randoms) = prover_demand(&shape, profile).unwrap();
+        let mut dealer = super::super::engine::Dealer::new(2, &[0xE7; 32]);
+        let shared: Vec<Vec<Sb>> = {
+            let mut per_party = vec![Vec::with_capacity(assignment.len()); 2];
+            for &val in &assignment {
+                let sh = dealer.share(val);
+                per_party[0].push(sh[0]);
+                per_party[1].push(sh[1]);
+            }
+            per_party
+        };
+        let preps = dealer.preprocessing(triples + 4, randoms + 4);
+        let out = super::super::engine::tests::run_parties(preps, |mut e| {
+            let me = e.me();
+            let res = prove_party_with_fault(
+                &mut e,
+                &shape,
+                &assignment[1..1 + shape.num_public],
+                b"tooth-poison",
+                profile,
+                shared[me].clone(),
+                &mut |point| {
+                    if me == 1
+                        && let Fault::Word(bytes) = point
+                    {
+                        // Truncate Stage-0 reduced polynomial `g` so `e.exchange_guarded` succeeds
+                        // (`e.failed` reset to `false`), then `open_table` hits `BadPeerMessage`.
+                        bytes.truncate(1);
+                    }
+                },
+            );
+            let post_random = e.random();
+            let post_check = e.check();
+            (res, post_random, post_check)
+        });
+        assert_eq!(out[0].0, Err(ProveError::BadPeerMessage { from: 1 }));
+        assert_eq!(out[0].1, Err(MpcError::MacCheck));
+        assert_eq!(out[0].2, Err(MpcError::MacCheck));
     }
 }

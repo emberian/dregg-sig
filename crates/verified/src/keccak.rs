@@ -276,7 +276,7 @@ impl Shake256Sponge {
     /// Absorb `data` into the sponge prior to squeezing.
     ///
     /// Panics once squeezing has begun, as production `Cshake256Xof::absorb` does
-    /// (`crates/dregg-sig-core/src/sponge/keccak.rs`): a late absorb is a caller bug, never a no-op.
+    /// (`crates/core/src/sponge/keccak.rs`): a late absorb is a caller bug, never a no-op.
     pub fn absorb(&mut self, data: &[u8]) {
         assert!(
             !self.squeezing,

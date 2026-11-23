@@ -24,6 +24,7 @@ mod policy_ledger;
 mod quorum;
 mod quorum_coupon;
 mod quorum_hem;
+mod quorum_wire;
 mod schemes;
 mod vault;
 
@@ -43,7 +44,7 @@ commands:
   verify            verify a signature
   addr              encode or decode addresses; derive a hybrid classical + post-quantum identity
   quorum            dealerless threshold signing & (t, n) -> (t', n') quorum-switching (sign/reshare/refresh)
-  aggregate         untrusted public signature aggregation (--pubkeys + --sigs + --message) or proof merge
+  aggregate         untrusted public or committee signature aggregation (`QSAGHQM2` Quintic Fp5)
   verify-aggregate  verify an aggregate proof (alias: verify-agg)
   cred              dealerless Poseidon2 TOPRF (replicated or Shamir-SPDZ) & threshold FIPS 204 ML-DSA ceremonies
   hd                dealerless post-quantum HD inventory & 0-round watch-only child derivation

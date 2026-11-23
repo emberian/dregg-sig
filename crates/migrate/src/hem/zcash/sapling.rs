@@ -14,8 +14,8 @@
 //! a 32-byte little-endian integer and every point is `repr_J`, 32 bytes.
 //!
 //! Secret scalars (`ask`, `nsk`, `ivk`) go through a fixed 256-step double-and-add with
-//! masked selection, and field arithmetic has no data-dependent branch. The square root
-//! used by point decompression is variable-time; it only sees public encodings.
+//! masked selection. Point decompression uses a fixed-schedule square root and reports
+//! whether the input is a valid encoding.
 
 use super::blake2::{Blake2b, blake2b_256, blake2s_256};
 use super::ff1::ff1_aes256_encrypt_88;
@@ -188,8 +188,16 @@ const fn limbs_to_le_bytes(limbs: &Limbs) -> [u8; 32] {
 }
 
 /// An element of the Jubjub base field, in Montgomery form and fully reduced.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(super) struct Fq(Limbs);
+
+impl PartialEq for Fq {
+    fn eq(&self, other: &Self) -> bool {
+        crate::limbs::ct_eq(self.0, other.0)
+    }
+}
+
+impl Eq for Fq {}
 
 impl Fq {
     pub(super) const ZERO: Fq = Fq([0; 4]);
@@ -260,34 +268,23 @@ impl Fq {
         self.to_bytes()[0] & 1 == 1
     }
 
-    /// A square root, by Tonelli-Shanks for `q - 1 = 2^32 * t`. Variable-time.
+    /// Fixed-schedule Tonelli-Shanks for `q - 1 = 2^32 * t`.
     fn sqrt(&self) -> Option<Fq> {
-        if *self == Fq::ZERO {
-            return Some(Fq::ZERO);
-        }
         let w = self.pow(&T_MINUS_1_OVER_2);
         let mut x = self.mul(&w);
         let mut b = x.mul(&w);
-        let mut z = ROOT_OF_UNITY;
-        let mut v = 32u32;
-        while b != Fq::ONE {
-            let mut k = 0u32;
-            let mut b2k = b;
-            while b2k != Fq::ONE {
-                b2k = b2k.square();
-                k += 1;
-                if k == v {
-                    return None;
-                }
+        let mut c = ROOT_OF_UNITY;
+        let minus_one = Fq::ONE.neg();
+        for r in (2..=32).rev() {
+            let mut d = b;
+            for _ in 0..r - 2 {
+                d = d.square();
             }
-            let mut w = z;
-            for _ in 0..v - k - 1 {
-                w = w.square();
-            }
-            z = w.square();
-            b = b.mul(&z);
-            x = x.mul(&w);
-            v = k;
+            let take = core::hint::black_box(0u64.wrapping_sub((d == minus_one) as u64));
+            let c2 = c.square();
+            x = Fq::select(take, &x.mul(&c), &x);
+            b = Fq::select(take, &b.mul(&c2), &b);
+            c = c2;
         }
         (x.square() == *self).then_some(x)
     }
@@ -437,10 +434,9 @@ impl Point {
         // never zero because -1/d is not a square.
         let num = v2.sub(&Fq::ONE);
         let den = Fq::ONE.add(&JUBJUB_D.mul(&v2));
-        let mut u = num.mul(&den.invert()).sqrt()?;
-        if u.is_odd() != sign {
-            u = u.neg();
-        }
+        let root = num.mul(&den.invert()).sqrt()?;
+        let flip = core::hint::black_box(0u64.wrapping_sub((root.is_odd() ^ sign) as u64));
+        let u = Fq::select(flip, &root.neg(), &root);
         Some(Point {
             u,
             v,
@@ -472,7 +468,9 @@ pub fn to_scalar(wide: &[u8; 64]) -> [u8; 32] {
         ];
         acc = reduce_once(&acc, 0, &R_J);
     }
-    limbs_to_bytes(&acc)
+    let bytes = limbs_to_bytes(&acc);
+    dregg_sig_asm::volatile_fill(&mut acc, 0);
+    bytes
 }
 
 /// `(a + b) mod r_J` for `a, b < r_J`.
@@ -768,6 +766,14 @@ struct ChildParts {
     ovk: [u8; 32],
     dk: [u8; 32],
     chain_code: [u8; 32],
+}
+
+impl Drop for ChildParts {
+    fn drop(&mut self) {
+        for field in [&mut self.i_ask, &mut self.i_nsk, &mut self.ovk, &mut self.dk, &mut self.chain_code] {
+            wipe(field);
+        }
+    }
 }
 
 /// Splits and expands `I`, then erases it.

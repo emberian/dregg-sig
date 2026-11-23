@@ -492,6 +492,12 @@ impl Challenges {
 }
 
 #[inline(always)]
+fn mac_is_zero(mac: Mac) -> bool {
+    let [a, b] = mac_words(mac);
+    dregg_sig_accel::ct::ct_eq_u64(a | b, 0)
+}
+
+#[inline(always)]
 fn mac_add(a: Mac, b: Mac) -> Mac {
     [a[0] + b[0], a[1] + b[1]]
 }
@@ -790,7 +796,7 @@ impl<'a> Ceremony<'a> {
                 payload,
                 &nonces[party],
             );
-            if opened != commitments[party] {
+            if !dregg_sig_asm::ct_eq_32(&opened, &commitments[party]) {
                 return Err(Check::Commitment.into());
             }
             for word in payload.iter() {
@@ -1131,7 +1137,8 @@ impl<'a> Ceremony<'a> {
             .map(|s| mac_words(*s).into_iter().collect())
             .collect();
         self.commit_then_open(b"field sigma", &payloads)?;
-        if sigma.iter().fold([F::ZERO; 2], |sum, s| mac_add(sum, *s)) != [F::ZERO; 2] {
+        let total = sigma.iter().fold([F::ZERO; 2], |sum, s| mac_add(sum, *s));
+        if !mac_is_zero(total) {
             return Err(site.into());
         }
         Ok(())
@@ -1406,7 +1413,7 @@ impl<'a> Ceremony<'a> {
                     [F::from_u64_reduced(share[0]), F::from_u64_reduced(share[1])],
                 )
             });
-            if sum != [F::ZERO; 2] {
+            if !mac_is_zero(sum) {
                 return Err(Check::KeyConsistency.into());
             }
         }
@@ -1522,8 +1529,8 @@ mod tests {
     use super::super::engine::tests::run_parties;
     use super::super::prover::{self, tests::small_relation};
     use super::*;
-    use dregg_sig_agg::pcs::WhirSecurityRegime;
-    use dregg_sig_agg::zk_hem::protocol::verify_split;
+    use dregg_sig_agg::zk_hem::v2::params::Profile;
+    use dregg_sig_agg::zk_hem::v2::protocol::verify_split;
     use std::{println, time::Instant};
 
     /// Real OT mesh over `parties` quorum members and their private generators.
@@ -2204,7 +2211,7 @@ mod tests {
     /// The ceremony's output drives the engine and the threshold prover: party 0 inputs
     /// a clear assignment, the quorum proves, the split verifier accepts.
     fn prove_on_ceremony_output(parties: usize) {
-        let regime = WhirSecurityRegime::default();
+        let regime = Profile::default();
         let (shape, assignment) = small_relation(5);
         let publics = assignment[1..=shape.num_public].to_vec();
         let (triples, randoms) = prover::prover_demand(&shape, regime).unwrap();
@@ -2237,7 +2244,7 @@ mod tests {
             assert_eq!(stats.randoms_used as usize, demand.randoms);
         }
         assert_eq!(proof.roots.len(), parties);
-        assert!(verify_split(&shape, &publics, b"stmt", regime, &proof));
+        assert!(proof.profile == regime && verify_split(&shape, &publics, b"stmt", regime, &proof));
         assert!(!verify_split(&shape, &publics, b"other", regime, &proof));
         println!(
             "N={parties}: {} triples, {} randoms per member; mesh {mesh_s:.2} s, ceremony \

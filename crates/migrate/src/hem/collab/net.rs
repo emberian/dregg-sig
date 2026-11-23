@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! "QSWF" || session[32] || from_be[2] || to_be[2] || round_tag_be[4] || seq_be[8]
-//!        || len_be[4] || 0x01 || ciphertext(fragment) || tag[32]
+//!        || len_be[4] || 0x01 || deployment_id[32] || ciphertext(fragment) || tag[32]
 //! ```
 //!
 //! with `round_tag` = [`ROUND_TAG`]. There is no plaintext transport in this module.
@@ -75,7 +75,7 @@ pub const ROUND_TAG: u32 = u32::from_be_bytes(*b"QSCF");
 /// Largest frame a [`Link`] is asked to carry.
 pub const MAX_SEALED_FRAME_BYTES: usize = wire::MAX_FRAME_PAYLOAD;
 /// Bytes a sealed frame adds to its fragment: header, mode byte and tag.
-pub const SEALED_FRAME_OVERHEAD_BYTES: usize = wire::FRAME_HEADER_BYTES + 1 + 32;
+pub const SEALED_FRAME_OVERHEAD_BYTES: usize = wire::SEALED_FRAME_OVERHEAD;
 /// Largest piece of a message in one sealed frame.
 pub const MAX_FRAGMENT_BYTES: usize = MAX_SEALED_FRAME_BYTES - SEALED_FRAME_OVERHEAD_BYTES - 1;
 /// Largest message of one [`Transport::send`].
@@ -198,6 +198,7 @@ impl<L: Link> Framed<L> {
     /// party shares with `p` alone (`keys[me]` is ignored). `session` must be new for
     /// these keys. `keys` is erased before this returns.
     pub fn new(
+        deployment_id: [u8; 32],
         session: [u8; 32],
         me: usize,
         links: Vec<Option<L>>,
@@ -216,7 +217,8 @@ impl<L: Link> Framed<L> {
             keys.iter_mut().for_each(dregg_sig_core::wipe::wipe_bytes32);
             return None;
         }
-        let channel = ConfidentialWireChannel::new(Links { me, links }, session, keys).ok()?;
+        let channel =
+            ConfidentialWireChannel::new(Links { me, links }, deployment_id, session, keys).ok()?;
         Some(Self {
             channel,
             partial: (0..n).map(|_| Vec::new()).collect(),
@@ -226,9 +228,7 @@ impl<L: Link> Framed<L> {
 
 impl<L: Link> Drop for Framed<L> {
     fn drop(&mut self) {
-        for partial in &mut self.partial {
-            dregg_sig_core::wipe::wipe_bytes(partial);
-        }
+        dregg_sig_core::wipe::wipe(&mut self.partial);
     }
 }
 
@@ -245,7 +245,7 @@ impl<L: Link> Transport for Framed<L> {
         if payload.len() > MAX_MESSAGE_BYTES {
             return Err(NetError::PayloadTooLarge);
         }
-        let mut fragment = Vec::with_capacity(1 + payload.len().min(MAX_FRAGMENT_BYTES));
+        let mut fragment = dregg_sig_core::wipe::SecretScratch::with_capacity(1 + payload.len().min(MAX_FRAGMENT_BYTES));
         let mut rest = payload;
         let sent = loop {
             let (data, tail) = rest.split_at(rest.len().min(MAX_FRAGMENT_BYTES));
@@ -260,7 +260,6 @@ impl<L: Link> Transport for Framed<L> {
             }
             rest = tail;
         };
-        dregg_sig_core::wipe::wipe_bytes(&mut fragment);
         sent
     }
 
@@ -276,9 +275,10 @@ impl<L: Link> Transport for Framed<L> {
                 Some((&more, data))
                     if more <= 1
                         && (more == 0 || data.len() == MAX_FRAGMENT_BYTES)
+                        && !(more == 0 && data.is_empty() && !partial.is_empty())
                         && partial.len() + data.len() <= MAX_MESSAGE_BYTES =>
                 {
-                    partial.extend_from_slice(data);
+                    dregg_sig_core::wipe::secret_vec_extend_from_slice(partial, data);
                     Some(more == 1)
                 }
                 _ => None,
@@ -399,7 +399,7 @@ mod with_std {
                 let keys = (0..parties)
                     .map(|p| in_process_pairwise_key(&session, me.min(p), me.max(p)))
                     .collect();
-                Framed::new(session, me, l, keys).expect("a full mesh")
+                Framed::new([0xDA; 32], session, me, l, keys).expect("a full mesh")
             })
             .collect()
     }
@@ -453,7 +453,7 @@ mod tests {
                     })
                     .collect();
                 let keys = (0..parties).map(|p| key(me, p)).collect();
-                Framed::new(session, me, links, keys).unwrap()
+                Framed::new([0xDA; 32], session, me, links, keys).unwrap()
             })
             .collect();
         (mesh, wires)
@@ -494,7 +494,7 @@ mod tests {
             }
         }
         // The same message twice is not the same ciphertext.
-        let body = wire::FRAME_HEADER_BYTES..first.len() - 32;
+        let body = wire::FRAME_HEADER_BYTES + 33..first.len() - 32;
         assert!(
             first[body.clone()]
                 .windows(8)
@@ -649,12 +649,19 @@ mod tests {
                 })
             ]
         };
-        assert!(Framed::new(SESSION, 0, links(), alloc::vec![[1; 32]; 2]).is_some());
-        assert!(Framed::new(SESSION, 1, links(), alloc::vec![[1; 32]; 2]).is_none());
-        assert!(Framed::new(SESSION, 0, links(), alloc::vec![[1; 32]; 1]).is_none());
-        assert!(Framed::new(SESSION, 0, links(), alloc::vec![[1; 32]; 3]).is_none());
+        assert!(Framed::new([0xDA; 32], SESSION, 0, links(), alloc::vec![[1; 32]; 2]).is_some());
+        assert!(Framed::new([0xDA; 32], SESSION, 1, links(), alloc::vec![[1; 32]; 2]).is_none());
+        assert!(Framed::new([0xDA; 32], SESSION, 0, links(), alloc::vec![[1; 32]; 1]).is_none());
+        assert!(Framed::new([0xDA; 32], SESSION, 0, links(), alloc::vec![[1; 32]; 3]).is_none());
         assert!(
-            Framed::<TapLink>::new(SESSION, 0, alloc::vec![None], alloc::vec![[1; 32]]).is_none()
+            Framed::<TapLink>::new(
+                [0xDA; 32],
+                SESSION,
+                0,
+                alloc::vec![None],
+                alloc::vec![[1; 32]]
+            )
+            .is_none()
         );
     }
 
@@ -711,10 +718,22 @@ mod tests {
         let mut replayer = sa.try_clone().unwrap();
         let written = Arc::new(Mutex::new(Vec::new()));
         let sa = Recorded(sa, written.clone());
-        let mut a =
-            Framed::new(session, 0, alloc::vec![None, Some(StreamLink(sa))], keys()).unwrap();
-        let mut b =
-            Framed::new(session, 1, alloc::vec![Some(StreamLink(sb)), None], keys()).unwrap();
+        let mut a = Framed::new(
+            [0xDA; 32],
+            session,
+            0,
+            alloc::vec![None, Some(StreamLink(sa))],
+            keys(),
+        )
+        .unwrap();
+        let mut b = Framed::new(
+            [0xDA; 32],
+            session,
+            1,
+            alloc::vec![Some(StreamLink(sb)), None],
+            keys(),
+        )
+        .unwrap();
         let big = pattern(200_000);
         let sender = {
             let big = big.clone();
@@ -740,5 +759,27 @@ mod tests {
         assert!(!written.windows(8).any(|w| w == &big[..8]));
         replayer.write_all(&written[..first]).unwrap();
         assert_eq!(b.recv(0), BAD);
+    }
+
+    #[test]
+    fn tooth_framed_recv_rejects_empty_final_continuation_fragment() {
+        // `#tooth`: `Framed::send` encodes an exact `MAX_FRAGMENT_BYTES` message as a
+        // single `[0x00, data...]` frame (`tail.is_empty()`). Previously `Framed::recv` also
+        // accepted `[0x01, data...]` followed by `[0x00]` (an empty trailing fragment), breaking
+        // unique canonical multi-fragment framing.
+        let (mut mesh, _) = tap_mesh(SESSION, 2, one_key);
+        let mut full_cont = Vec::with_capacity(1 + MAX_FRAGMENT_BYTES);
+        full_cont.push(1u8);
+        full_cont.extend(core::iter::repeat_n(0xABu8, MAX_FRAGMENT_BYTES));
+        mesh[0]
+            .channel
+            .send_frame(1, ROUND_TAG, &full_cont)
+            .unwrap();
+        mesh[0].channel.send_frame(1, ROUND_TAG, &[0u8]).unwrap();
+        assert_eq!(mesh[1].recv(0), BAD);
+
+        // Single-frame empty message `[0x00]` with empty `partial` remains valid.
+        mesh[0].send(1, b"").unwrap();
+        assert_eq!(mesh[1].recv(0).unwrap(), b"");
     }
 }

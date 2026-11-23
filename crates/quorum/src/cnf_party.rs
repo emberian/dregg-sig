@@ -84,6 +84,8 @@ use crate::hash::{SeedRng, expand, h32};
 use crate::party_node::{PoisonJournal, ROUND_ABORT};
 use crate::wire_channel::{MacSealedWireChannel, TransportError, WireTransport};
 
+mod frontier;
+
 /// Reshare corrections of one multiplication batch.
 pub const ROUND_CNF_MUL: u32 = 0x0400_0000;
 /// Pairwise slot-view digests.
@@ -281,6 +283,8 @@ impl Topology {
 /// `sk_prf` and PRSS seed) and its pairwise link keys. Wiped on drop, not `Clone`, opaque
 /// `Debug`.
 pub struct CnfPartyKeys {
+    fresh_dkg: bool,
+    deployment_id: [u8; 32],
     cfg: CnfRssConfig,
     party: usize,
     key_len: usize,
@@ -320,10 +324,33 @@ impl fmt::Debug for CnfPartyKeys {
 }
 
 impl CnfPartyKeys {
+    /// Move a fresh wire DKG result into a persistable per-party QSCNFK01 share.
+    /// Imported endpoints domain-separate signing link keys from the DKG links.
+    pub fn finish_enrollment(mut self) -> Result<CnfRssKeyShare256, CnfPartyError> {
+        if !self.fresh_dkg || self.scheme_identity.is_some() || self.slh_profile_digest.is_some() {
+            return Err(CnfPartyError::InvalidParameters);
+        }
+        wipe_bytes32(&mut self.link_keys[self.party]);
+        CnfRssKeyShare256::from_dkg_slots(
+            self.cfg.clone(),
+            self.party,
+            self.key_len,
+            self.pk_seed,
+            SecretBuffer(core::mem::take(&mut self.key_shares)),
+            SecretBuffer(core::mem::take(&mut self.prf_shares)),
+            SecretBuffer(core::mem::take(&mut self.prss_seeds)),
+            SecretBuffer(core::mem::take(&mut self.link_keys)),
+        )
+        .map_err(|_| CnfPartyError::InvalidParameters)
+    }
+
     /// Load exactly the slots `share` holds (`sk_seed`, `sk_prf` and slot PRSS seeds). The
     /// link keys are derived from the custody share's pairwise PRF keys, which the custody
     /// DKG established between each pair.
-    pub fn from_custody(share: &CnfRssKeyShare256) -> Result<Self, CnfPartyError> {
+    pub fn from_custody(
+        deployment_id: [u8; 32],
+        share: &CnfRssKeyShare256,
+    ) -> Result<Self, CnfPartyError> {
         let cfg = share.config().clone();
         let party = share.party_id;
         Topology::new(&cfg, party)?;
@@ -352,6 +379,8 @@ impl CnfPartyKeys {
             }
         }
         Ok(Self {
+            fresh_dkg: false,
+            deployment_id,
             cfg,
             party,
             key_len: share.key_len,
@@ -444,7 +473,16 @@ fn recv_checked<T: WireTransport>(
     round: u32,
     len: usize,
 ) -> Result<Vec<u8>, CnfPartyError> {
-    match transport.recv_frame(from, round) {
+    check_received(transport.recv_frame(from, round), from, round, len)
+}
+
+fn check_received(
+    received: Result<Vec<u8>, TransportError>,
+    from: usize,
+    round: u32,
+    len: usize,
+) -> Result<Vec<u8>, CnfPartyError> {
+    match received {
         Ok(mut payload) => {
             if payload.len() == len {
                 Ok(payload)
@@ -481,9 +519,19 @@ fn send_abort<T: WireTransport>(transport: &mut T, topo: &Topology) {
 ///
 /// A contribution opened last can depend on the others only through an abort, so each slot
 /// seed is uniform as long as one holder is honest; every slot has one.
+///
+/// During opening, an authenticated commitment mismatch takes precedence over link errors
+/// and peer aborts. A peer can queue its bad opening and disconnect before we send ours, or
+/// an honest peer can reject first and close its links. Neither schedule hides the queued
+/// evidence: we attempt every opening send, then inspect every peer in index order until a
+/// mismatch is found. After a transport failure this is abort-only diagnosis; the channel
+/// stays closed and no key can be returned, even if all received openings are valid. The
+/// accusation requires the actual authenticated opening, not a peer's claimed abort reason;
+/// a missing opening remains a transport/abort error, not evidence of a bad commitment.
 pub fn run_isolated_cnf_dkg<T: WireTransport>(
     cfg: &CnfRssConfig,
     key_len: usize,
+    deployment_id: [u8; 32],
     transport: T,
     session_id: [u8; 32],
     link_keys: Vec<[u8; 32]>,
@@ -498,6 +546,8 @@ pub fn run_isolated_cnf_dkg<T: WireTransport>(
         return Err(CnfPartyError::InvalidParameters);
     }
     let mut keys = CnfPartyKeys {
+        fresh_dkg: true,
+        deployment_id,
         cfg: cfg.clone(),
         party: me,
         key_len,
@@ -510,8 +560,10 @@ pub fn run_isolated_cnf_dkg<T: WireTransport>(
         scheme_identity: None,
         slh_profile_digest: None,
     };
+    let session_id = h32(b"QSAG.CNF.DKG/v2", &[&deployment_id, &session_id]);
     let dkg_session = h32(b"cnf-party/dkg-session", &[&session_id]);
-    let mut channel = MacSealedWireChannel::new_encrypted(transport, dkg_session, link_keys)?;
+    let mut channel =
+        MacSealedWireChannel::new_encrypted(transport, deployment_id, dkg_session, link_keys)?;
     let outcome = dkg_inner(&topo, key_len, &mut channel, &session_id, rng, &mut keys);
     match outcome {
         Ok(()) => Ok(keys),
@@ -596,6 +648,7 @@ fn dkg_inner<T: WireTransport>(
             coms[i][peer] = *chunk;
         }
     }
+    let mut opening_error = None;
     for peer in topo.peers() {
         let mut payload = Vec::new();
         for i in items_with(peer) {
@@ -604,11 +657,24 @@ fn dkg_inner<T: WireTransport>(
         }
         let sent = channel.send_frame(peer, ROUND_CNF_DKG_OPEN, &payload);
         wipe_bytes(&mut payload);
-        sent?;
+        if let Err(error) = sent {
+            opening_error.get_or_insert(CnfPartyError::Transport(error));
+        }
     }
     for peer in topo.peers() {
         let items = items_with(peer);
-        let mut raw = recv_checked(channel, peer, ROUND_CNF_DKG_OPEN, 64 * items.len())?;
+        let received = if opening_error.is_some() {
+            channel.recv_frame_for_abort(peer, ROUND_CNF_DKG_OPEN)
+        } else {
+            channel.recv_frame(peer, ROUND_CNF_DKG_OPEN)
+        };
+        let mut raw = match check_received(received, peer, ROUND_CNF_DKG_OPEN, 64 * items.len()) {
+            Ok(raw) => raw,
+            Err(error) => {
+                opening_error.get_or_insert(error);
+                continue;
+            }
+        };
         let mut ok = true;
         for (chunk, &i) in raw.as_chunks::<64>().0.iter().zip(&items) {
             let (salt, contribution) = chunk.split_at(32);
@@ -627,6 +693,9 @@ fn dkg_inner<T: WireTransport>(
         if !ok {
             return Err(CnfPartyError::OpeningRejected { party: peer });
         }
+    }
+    if let Some(error) = opening_error {
+        return Err(error);
     }
     let derive = |i: usize, out: &mut [u8]| {
         let mut xof = Cshake256Xof::new_shake256();
@@ -978,6 +1047,22 @@ impl fmt::Debug for IsolatedCnfSweep {
 // The party
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct ReceivedFrame {
+    from: usize,
+    round: u32,
+    len: usize,
+    digest: [u8; 32],
+}
+
+#[cfg(test)]
+impl ReceivedFrame {
+    fn shape(&self) -> (usize, u32, usize) {
+        (self.from, self.round, self.len)
+    }
+}
+
 /// One party of the isolated CNF engine. See the module documentation.
 pub struct IsolatedCnfParty<T: WireTransport, J: PoisonJournal> {
     topo: Topology,
@@ -1016,9 +1101,9 @@ pub struct IsolatedCnfParty<T: WireTransport, J: PoisonJournal> {
     fault: Option<Fault>,
     #[cfg(test)]
     record_received: bool,
-    /// Plaintext of every frame received, for view tests.
+    /// Per-frame shape and plaintext digest used by the view tests.
     #[cfg(test)]
-    received: Vec<(usize, u32, Vec<u8>)>,
+    received: Vec<ReceivedFrame>,
 }
 
 impl<T: WireTransport, J: PoisonJournal> Drop for IsolatedCnfParty<T, J> {
@@ -1030,13 +1115,14 @@ impl<T: WireTransport, J: PoisonJournal> Drop for IsolatedCnfParty<T, J> {
 impl<T: WireTransport, J: PoisonJournal> IsolatedCnfParty<T, J> {
     /// Build the party of `share`'s custodian for one session.
     pub fn from_custody(
+        deployment_id: [u8; 32],
         share: &CnfRssKeyShare256,
         transport: T,
         session_id: [u8; 32],
         rng_seed: &[u8; 32],
         journal: J,
     ) -> Result<Self, CnfPartyError> {
-        let keys = CnfPartyKeys::from_custody(share)?;
+        let keys = CnfPartyKeys::from_custody(deployment_id, share)?;
         Self::new(&keys, transport, session_id, rng_seed, journal)
     }
 
@@ -1065,8 +1151,17 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedCnfParty<T, J> {
         journal
             .reserve_session(&session_id)
             .map_err(|_| CnfPartyError::Journal)?;
-        let transport =
-            MacSealedWireChannel::new_encrypted(transport, session_id, keys.link_keys.clone())?;
+        let transport = MacSealedWireChannel::new_encrypted(
+            transport,
+            keys.deployment_id,
+            session_id,
+            keys.link_keys.clone(),
+        )?;
+        let prss_seeds: Vec<_> = keys
+            .prss_seeds
+            .iter()
+            .map(|seed| h32(b"QSAG.CNF.PRSS/v2", &[&keys.deployment_id, seed]))
+            .collect();
         let mut r = Vec::with_capacity(topo.held.len());
         let mut transcripts = Vec::with_capacity(topo.held.len());
         for (l, &slot) in topo.held.iter().enumerate() {
@@ -1074,7 +1169,7 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedCnfParty<T, J> {
             expand(
                 b"cnf-party/prss-key",
                 &[
-                    &keys.prss_seeds[l],
+                    &prss_seeds[l],
                     &session_id,
                     &(slot as u64).to_be_bytes(),
                     &[PURPOSE_MAC_KEY],
@@ -1086,7 +1181,7 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedCnfParty<T, J> {
             // Keyed by the slot seed: only a holder can produce or check this digest.
             let mut xof = Cshake256Xof::new_shake256();
             absorb_framed(&mut xof, b"cnf-party/slot-view");
-            absorb_framed(&mut xof, &keys.prss_seeds[l]);
+            absorb_framed(&mut xof, &prss_seeds[l]);
             absorb_framed(&mut xof, &session_id);
             absorb_framed(&mut xof, &(slot as u64).to_be_bytes());
             absorb_framed(&mut xof, &(keys.key_len as u64).to_be_bytes());
@@ -1115,10 +1210,10 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedCnfParty<T, J> {
             pk_seed: keys.pk_seed,
             key_shares: keys.key_shares.clone(),
             prf_shares: keys.prf_shares.clone(),
-            prss_seeds: keys.prss_seeds.clone(),
+            prss_seeds,
             scheme_identity: keys.scheme_identity,
             slh_profile_digest: keys.slh_profile_digest,
-            rng: SeedRng::new(rng_seed, b"cnf-party"),
+            rng: SeedRng::new(rng_seed, &h32(b"QSAG.CNF.COINS/v2", &[&keys.deployment_id, &session_id])),
             r,
             transcripts,
             coin_binding: [0; 32],
@@ -1243,7 +1338,12 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedCnfParty<T, J> {
         let payload = recv_checked(&mut self.transport, from, round, len)?;
         #[cfg(test)]
         if self.record_received {
-            self.received.push((from, round, payload.clone()));
+            self.received.push(ReceivedFrame {
+                from,
+                round,
+                len: payload.len(),
+                digest: h32(b"qsag-test/received-frame", &[&payload]),
+            });
         }
         Ok(payload)
     }
@@ -3139,7 +3239,16 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedSlhBackend for IsolatedCnfParty
                 }
                 party.keccak_f_batch(&mut st)?;
 
-                let max_steps = chunk.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
+                // All supported FIPS 205 profiles use base 16. Keep the wire
+                // schedule independent of the selected leaf and WOTS digits.
+                let max_steps = chunk
+                    .iter()
+                    .map(|(adrs, steps)| match adrs.adrs_type {
+                        dregg_sig_core::fips205::Fips205AdrsType::WotsPrf => steps.len().max(15),
+                        _ => steps.len(),
+                    })
+                    .max()
+                    .unwrap_or(0);
                 let mut cur_bits = Vec::with_capacity(c_len);
                 let mut cur_rand = Vec::with_capacity(c_len);
                 for sp in 0..c_len {
@@ -3149,26 +3258,25 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedSlhBackend for IsolatedCnfParty
                 }
 
                 for step in 0..max_steps {
-                    let active: Vec<usize> =
-                        (0..c_len).filter(|&sp| chunk[sp].1.len() > step).collect();
-                    if active.is_empty() {
-                        break;
-                    }
-                    let step_frames: Vec<[u8; RATE_BYTES]> = active
+                    let step_frames: Vec<[u8; RATE_BYTES]> = chunk
                         .iter()
-                        .map(|&sp| {
+                        .map(|(_, steps)| {
                             let mut frame = [0u8; RATE_BYTES];
+                            let adrs = steps.get(step).unwrap_or(&Fips205Adrs::ZERO);
                             frame[0..n].copy_from_slice(pk_seed);
-                            frame[n..n + 32].copy_from_slice(&chunk[sp].1[step].to_bytes());
+                            frame[n..n + 32].copy_from_slice(&adrs.to_bytes());
                             frame[2 * n + 32] = 0x1f;
                             frame[RATE_BYTES - 1] ^= 0x80;
                             frame
                         })
                         .collect();
                     let mut step_st = party.init_batch_states(&[0u64; 25], &step_frames);
-                    for (batch_pos, &sp) in active.iter().enumerate() {
+                    for (sp, (_, steps)) in chunk.iter().enumerate() {
+                        if step >= steps.len() {
+                            continue;
+                        }
                         step_st.absorb_secret_words(
-                            batch_pos,
+                            sp,
                             sec_off,
                             key_words,
                             &cur_bits[sp],
@@ -3179,8 +3287,11 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedSlhBackend for IsolatedCnfParty
                         wipe_sponge_chain_state(&mut cur_bits, &mut cur_rand);
                         return Err(e);
                     }
-                    for (batch_pos, &sp) in active.iter().enumerate() {
-                        let (b, r) = step_st.extract_secret_words(batch_pos, key_words);
+                    for (sp, (_, steps)) in chunk.iter().enumerate() {
+                        if step >= steps.len() {
+                            continue;
+                        }
+                        let (b, r) = step_st.extract_secret_words(sp, key_words);
                         for slot in &mut cur_bits[sp] {
                             wipe_u64s(slot);
                         }
@@ -3332,7 +3443,7 @@ mod tests {
         let (shares, _) = run_dealerless_cnf_rss_dkg([tape; 32], &cfg, key_len, &mut rngs).unwrap();
         shares
             .iter()
-            .map(|s| CnfPartyKeys::from_custody(s).unwrap())
+            .map(|s| CnfPartyKeys::from_custody([0xDA; 32], s).unwrap())
             .collect()
     }
 
@@ -3472,7 +3583,7 @@ mod tests {
                 let endpoint = endpoint.take().unwrap();
                 let links = (0..n).map(|q| link(p, q)).collect();
                 let mut rng = SeedRng::new(&[0x70 + p as u8; 32], b"dkg");
-                run_isolated_cnf_dkg(&cfg, 16, endpoint, session, links, &mut rng)
+                run_isolated_cnf_dkg(&cfg, 16, [0xDA; 32], endpoint, session, links, &mut rng)
             })
             .into_iter()
             .map(Result::unwrap)
@@ -3534,7 +3645,7 @@ mod tests {
                     session
                 };
                 let mut rng = SeedRng::new(&[0x70 + p as u8; 32], b"dkg");
-                run_isolated_cnf_dkg(&cfg, 16, endpoint, sid, links, &mut rng).map(|_| ())
+                run_isolated_cnf_dkg(&cfg, 16, [0xDA; 32], endpoint, sid, links, &mut rng).map(|_| ())
             });
             assert!(out.iter().all(Result::is_err), "{out:?}");
         }
@@ -3583,9 +3694,9 @@ mod tests {
         }
     }
 
-    type ReceivedLog = Vec<(usize, u32, Vec<u8>)>;
+    type ReceivedLog = Vec<ReceivedFrame>;
 
-    /// Run the keyed hash and return the frame log and every party's received plaintexts.
+    /// Run the keyed hash and return the frame log and the length and digest of received plaintexts.
     fn recorded_run(
         keys: &[CnfPartyKeys],
         session: [u8; 32],
@@ -3655,10 +3766,10 @@ mod tests {
             assert_eq!(base[c].len(), other[c].len());
             let mut honest_corrections = 0;
             for (a, b) in base[c].iter().zip(&other[c]) {
-                assert_eq!((a.0, a.1, a.2.len()), (b.0, b.1, b.2.len()));
-                if a.1 == ROUND_CNF_MUL && !coalition.contains(&a.0) {
+                assert_eq!(a.shape(), b.shape());
+                if a.round == ROUND_CNF_MUL && !coalition.contains(&a.from) {
                     honest_corrections += 1;
-                    assert_ne!(a.2, b.2);
+                    assert_ne!(a.digest, b.digest);
                 }
             }
             assert_eq!(honest_corrections, 3 * 27);
@@ -3676,8 +3787,8 @@ mod tests {
         assert_ne!(opened_base, opened_third);
         assert_eq!(opened_third[0], keyed_hash_reference(&resecret));
         for &c in &coalition {
-            let shape = |log: &[(usize, u32, Vec<u8>)]| -> Vec<(usize, u32, usize)> {
-                log.iter().map(|m| (m.0, m.1, m.2.len())).collect()
+            let shape = |log: &ReceivedLog| -> Vec<(usize, u32, usize)> {
+                log.iter().map(ReceivedFrame::shape).collect()
             };
             assert_eq!(shape(&base[c]), shape(&third[c]));
         }
@@ -3982,26 +4093,82 @@ mod tests {
         p
     }
 
+    /// Hold honest opening sends until the corrupt sender has dropped all its links.
+    /// Unlike a sleep, this forces the schedule that used to hide the queued evidence.
+    struct DkgOpeningGate {
+        endpoint: InMemoryEndpoint,
+        before_open: Option<Arc<std::sync::Barrier>>,
+    }
+
+    impl WireTransport for DkgOpeningGate {
+        fn party(&self) -> usize {
+            self.endpoint.party()
+        }
+
+        fn parties(&self) -> usize {
+            self.endpoint.parties()
+        }
+
+        fn send_frame(
+            &mut self,
+            peer: usize,
+            round: u32,
+            payload: &[u8],
+        ) -> Result<(), TransportError> {
+            if round == ROUND_CNF_DKG_OPEN
+                && let Some(gate) = self.before_open.take()
+            {
+                gate.wait();
+            }
+            self.endpoint.send_frame(peer, round, payload)
+        }
+
+        fn recv_frame(&mut self, peer: usize, round: u32) -> Result<Vec<u8>, TransportError> {
+            self.endpoint.recv_frame(peer, round)
+        }
+
+        fn recv_authenticated_envelope(
+            &mut self,
+            peer: usize,
+            round: u32,
+        ) -> Result<Vec<u8>, TransportError> {
+            self.endpoint.recv_authenticated_envelope(peer, round)
+        }
+    }
+
     #[test]
     fn wire_dkg_corrupted_opening_aborts_with_opening_rejected() {
-        for (t, n) in [(2usize, 3usize), (3, 5)] {
+        let schedules = [(2usize, 3usize), (3, 5)].into_iter().flat_map(|(t, n)| {
+            (0..n).flat_map(move |p| [true, false].map(|forced| (t, n, p, forced)))
+        });
+        for (t, n, corrupt, force_disconnect, corrupt_opening) in
+            schedules.flat_map(|(t, n, p, forced)| [true, false].map(|bad| (t, n, p, forced, bad)))
+        {
             let cfg = CnfRssConfig::new(t, n).unwrap();
             let session = [0x9A + n as u8; 32];
             let link = |a: usize, b: usize| [(7 + a.min(b) * 16 + a.max(b)) as u8; 32];
-            let (endpoints, _) = InMemoryWireMesh::connect(n, session);
+            let (endpoints, stats) = InMemoryWireMesh::connect(n, session);
             let endpoints: Vec<_> = endpoints.into_iter().map(Some).collect();
+            let gate = force_disconnect.then(|| Arc::new(std::sync::Barrier::new(n)));
 
             let out = run_isolated_cnf_ceremony(endpoints, |p, endpoint| {
                 let mut endpoint = endpoint.take().unwrap();
                 endpoint.set_timeout(Duration::from_secs(10));
+                let endpoint = DkgOpeningGate {
+                    endpoint,
+                    before_open: if p == corrupt { None } else { gate.clone() },
+                };
                 let links: Vec<[u8; 32]> = (0..n).map(|q| link(p, q)).collect();
-                if p == 0 {
-                    // Corrupted party 0 possesses valid link keys, commits honestly in Round 1,
+                if p == corrupt {
+                    // The corrupted party possesses valid link keys, commits honestly in Round 1,
                     // then flips a contribution byte in Round 2 (`ROUND_CNF_DKG_OPEN`).
-                    let topo = Topology::new(&cfg, 0).unwrap();
+                    // The valid-opening control must abort without accusing this peer
+                    // of a commitment mismatch, even though it also disconnects early.
+                    let topo = Topology::new(&cfg, corrupt).unwrap();
+                    let session = h32(b"QSAG.CNF.DKG/v2", &[&[0xDA; 32], &session]);
                     let dkg_session = h32(b"cnf-party/dkg-session", &[&session]);
                     let mut chan =
-                        MacSealedWireChannel::new_encrypted(endpoint, dkg_session, links).unwrap();
+                        MacSealedWireChannel::new_encrypted(endpoint, [0xDA; 32], dkg_session, links).unwrap();
                     let held = topo.held.len();
                     let salt = [0x11u8; 32];
                     let contrib = [0x22u8; 32];
@@ -4013,7 +4180,7 @@ mod tests {
                         }
                     };
                     let my_coms: Vec<[u8; 32]> = (0..=held)
-                        .map(|i| dkg_commitment(&session, item_id(i), 0, &salt, &contrib))
+                        .map(|i| dkg_commitment(&session, item_id(i), corrupt, &salt, &contrib))
                         .collect();
                     for peer in topo.peers() {
                         let mut items = topo.common(peer);
@@ -4031,7 +4198,7 @@ mod tests {
                         let _ = recv_checked(&mut chan, peer, ROUND_CNF_DKG_COMMIT, 32 * items.len());
                     }
                     let mut bad_contrib = contrib;
-                    bad_contrib[0] ^= 0x01;
+                    bad_contrib[0] ^= u8::from(corrupt_opening);
                     for peer in topo.peers() {
                         let mut items = topo.common(peer);
                         items.push(held);
@@ -4042,18 +4209,40 @@ mod tests {
                         }
                         let _ = chan.send_frame(peer, ROUND_CNF_DKG_OPEN, &payload);
                     }
-                    Err(CnfPartyError::OpeningRejected { party: 0 })
+                    drop(chan);
+                    if let Some(gate) = &gate {
+                        gate.wait();
+                    }
+                    Err(CnfPartyError::OpeningRejected { party: corrupt })
                 } else {
                     let mut rng = SeedRng::new(&[0x80 + p as u8; 32], b"dkg-bad-open");
-                    run_isolated_cnf_dkg(&cfg, 32, endpoint, session, links, &mut rng).map(|_| ())
+                    run_isolated_cnf_dkg(&cfg, 32, [0xDA; 32], endpoint, session, links, &mut rng).map(|_| ())
                 }
             });
 
-            for (p, res) in out.iter().enumerate().skip(1) {
-                assert_eq!(
-                    *res,
-                    Err(CnfPartyError::OpeningRejected { party: 0 }),
-                    "honest party {p} must reject corrupted DKG opening from party 0"
+            for (p, res) in out.iter().enumerate().filter(|(p, _)| *p != corrupt) {
+                if corrupt_opening {
+                    assert_eq!(
+                        *res,
+                        Err(CnfPartyError::OpeningRejected { party: corrupt }),
+                        "honest party {p} must reject corrupted DKG opening from party {corrupt}; forced disconnect: {force_disconnect}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            res,
+                            Err(CnfPartyError::Transport(_) | CnfPartyError::PeerAborted { .. })
+                        ),
+                        "valid opening plus disconnect must fail without a false accusation: {res:?}"
+                    );
+                }
+            }
+            if force_disconnect {
+                assert!(
+                    stats
+                        .frames()
+                        .iter()
+                        .all(|f| f.round_tag != ROUND_CNF_DKG_CONFIRM)
                 );
             }
         }
@@ -4081,7 +4270,7 @@ mod tests {
                     let ep = ep.take().unwrap();
                     let links = (0..n).map(|q| link(p, q)).collect();
                     let mut rng = SeedRng::new(&[0x60 + p as u8; 32], b"baggy-wire-dkg");
-                    run_isolated_cnf_dkg(&cfg, 32, ep, dkg_sid, links, &mut rng).unwrap()
+                    run_isolated_cnf_dkg(&cfg, 32, [0xDA; 32], ep, dkg_sid, links, &mut rng).unwrap()
                 })
             } else {
                 custody_keys(t, n, 32, 0x47)
@@ -4164,7 +4353,7 @@ mod tests {
         let params = compact_slh_params();
         // 400-byte message forces 4 full SHAKE256 sponge blocks inside `eval_prf_msg_verified`.
         let msg = vec![0x5Au8; 400];
-        let ctx = b"qsag-subcarbon-q1-isolated-slh";
+        let ctx = b"qsag-isolated-cnf-slh-ctx";
 
         for (t, n) in [(2usize, 3usize), (3, 5)] {
             let mut keys = custody_keys(t, n, 16, 0x68 + n as u8);
@@ -4242,8 +4431,8 @@ mod tests {
 
         let run_slh_recorded = |ks: &[CnfPartyKeys], pk_ref: &SlhPublicKey| {
             let (ps, _) = parties_with_timeout(ks, session, &[], Duration::from_secs(60));
-            let out = run_isolated_cnf_ceremony(ps, |_, party: &mut Party| {
-                party.record_received = true;
+            let out = run_isolated_cnf_ceremony(ps, |i, party: &mut Party| {
+                party.record_received = matches!(i, 3 | 4);
                 let sig = party.slh_sign(&params, msg, ctx, pk_ref, None).unwrap();
                 (core::mem::take(&mut party.received), sig)
             });
@@ -4273,10 +4462,10 @@ mod tests {
             assert_eq!(base_logs[c].len(), reseed_logs[c].len());
             let mut honest_mul_frames = 0usize;
             for (a, b) in base_logs[c].iter().zip(&reseed_logs[c]) {
-                assert_eq!((a.0, a.1, a.2.len()), (b.0, b.1, b.2.len()));
-                if a.1 == ROUND_CNF_MUL && !coalition.contains(&a.0) {
+                assert_eq!(a.shape(), b.shape());
+                if a.round == ROUND_CNF_MUL && !coalition.contains(&a.from) {
                     honest_mul_frames += 1;
-                    assert_ne!(a.2, b.2);
+                    assert_ne!(a.digest, b.digest);
                 }
             }
             assert!(honest_mul_frames > 100);
@@ -4306,10 +4495,12 @@ mod tests {
         assert_ne!(base_sigs[0], alt_sigs[0]);
         assert!(slh_verify(&params, msg, &alt_sigs[0], ctx, &alt_pk));
         for &c in &coalition {
-            let shape = |log: &ReceivedLog| -> Vec<(usize, u32, usize)> {
-                log.iter().map(|m| (m.0, m.1, m.2.len())).collect()
-            };
-            assert_eq!(shape(&base_logs[c]), shape(&alt_logs[c]));
+            let base = &base_logs[c];
+            let alt = &alt_logs[c];
+            for (i, (a, b)) in base.iter().zip(alt).enumerate() {
+                assert_eq!(a.shape(), b.shape(), "observer {c}, frame {i}");
+            }
+            assert_eq!(base.len(), alt.len(), "observer {c} frame count");
         }
 
         // Part B: Active-cheater faults during full `SLH-DSA` and `Baggy` signing abort and poison!
@@ -4389,6 +4580,72 @@ mod tests {
             assert!(res.is_err());
             assert!(poisoned);
         }
+    }
+
+    #[test]
+    fn tooth_frontier_sign_poisoned_or_mismatched_pk_preserves_epoch_wal_and_identity() {
+        // `#tooth`: `frontier_sign` previously locked `scheme_identity` and called
+        // `wal.reserve_use(&key, 1)` BEFORE checking `self.is_poisoned()` or `pk.pk_seed == self.pk_seed`,
+        // permanently burning the one-time `FrontierFtsPublicKey` epoch WAL slot on a poisoned party!
+        use dregg_sig_fts::{
+            FrontierFtsError, FrontierFtsProfile, FrontierFtsPublicKey, FtsEpochWal,
+        };
+
+        #[derive(Default)]
+        struct TestEpochWal(alloc::collections::BTreeMap<[u8; 32], u8>);
+        impl FtsEpochWal for TestEpochWal {
+            fn uses_completed(&self, key: &[u8; 32]) -> Result<u8, FrontierFtsError> {
+                Ok(*self.0.get(key).unwrap_or(&0))
+            }
+            fn reserve_use(&mut self, key: &[u8; 32], next: u8) -> Result<(), FrontierFtsError> {
+                let prev = *self.0.get(key).unwrap_or(&0);
+                if next <= prev {
+                    return Err(FrontierFtsError::PersistenceFailed);
+                }
+                self.0.insert(*key, next);
+                Ok(())
+            }
+        }
+
+        let keys = custody_keys(2, 3, 32, 0x9D);
+        let (mut parties, _) = parties_with_timeout(&keys, [0x9E; 32], &[], Duration::from_secs(5));
+        let mut p0 = parties.remove(0);
+
+        let bad_seed_pk = FrontierFtsPublicKey {
+            profile: FrontierFtsProfile::Compact1122,
+            pk_seed: [0xFF; 32],
+            root: vec![0xAA; 32],
+        };
+        let mut wal = TestEpochWal::default();
+        assert_eq!(
+            p0.frontier_sign(&bad_seed_pk, b"msg", &[0x11; 32], &mut wal),
+            Err(CnfPartyError::InvalidParameters)
+        );
+        assert_eq!(
+            p0.scheme_identity(),
+            None,
+            "mismatched pk_seed must not lock scheme_identity"
+        );
+
+        let good_pk = FrontierFtsPublicKey {
+            profile: FrontierFtsProfile::Compact1122,
+            pk_seed: keys[0].pk_seed,
+            root: vec![0xBB; 32],
+        };
+        p0.poisoned = true;
+        assert_eq!(
+            p0.frontier_sign(&good_pk, b"msg", &[0x11; 32], &mut wal),
+            Err(CnfPartyError::Poisoned)
+        );
+        assert_eq!(
+            p0.scheme_identity(),
+            None,
+            "poisoned party must not mutate scheme_identity"
+        );
+        let key = good_pk.wal_key();
+        // Because `wal.reserve_use` was NOT burned on the poisoned party, an intact session can still reserve use 1!
+        wal.reserve_use(&key, 1)
+            .expect("single-use epoch WAL slot must remain unreserved after poisoned preflight");
     }
 
     #[test]

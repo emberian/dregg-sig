@@ -4,21 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Proofs that the holder of a legacy key (Bitcoin, Ethereum, Ed25519, BIP-32) authorises a post-quantum address, over zk-Hem, with a durable one-way migration registry"
+description = "Zero-knowledge ownership migration proofs (`zk-Hem v2`), threshold collaborative prover (`collab`), Zcash NU7 (`ZIP-2005`/`2007`, Orchard, Sapling), and durable nullifier registry"
 
 [features]
-default = ["alloc"]
-alloc = ["dregg-sig-accel/alloc", "dregg-sig-addr/alloc"]
-std = ["alloc", "dregg-sig-accel/std", "dregg-sig-addr/std", "dregg-sig-asm/std", "dregg-sig-core/std", "dregg-sig-agg/std"]
-# Deterministic single-seed preprocessing for tests and benchmarks. A build with
-# this feature contains a generator that knows every MAC key; never ship it.
-test-dealer = []
+default = ["std"]
+std = [
+    "dregg-sig-core/std",
+    "dregg-sig-asm/std",
+    "dregg-sig-accel/std",
+    "dregg-sig-addr/std",
+    "dregg-sig-agg/std",
+    "dregg-sig-quorum/std",
+]
 
 [dependencies]
 dregg-sig-core = { path = "../core", default-features = false }
 dregg-sig-asm = { path = "../asm", default-features = false }
 dregg-sig-accel = { path = "../accel", default-features = false }
 dregg-sig-addr = { path = "../addr", default-features = false }
-dregg-sig-agg = { path = "../agg", default-features = false, features = ["alloc"] }
-# Only `wire_channel::ConfidentialWireChannel`, the sealed channel under `hem::collab::net`.
+dregg-sig-agg = { path = "../agg", default-features = false }
 dregg-sig-quorum = { path = "../quorum", default-features = false }

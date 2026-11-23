@@ -280,6 +280,7 @@ version = "0.1.0"
 dependencies = [
  "dregg-sig-asm",
  "dregg-sig-core",
+ "dregg-sig-cred",
  "dregg-sig-whir-verified",
 ]
 
@@ -297,6 +298,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "dregg-sig-cred"
+version = "0.1.0"
+dependencies = [
+ "dregg-sig-accel",
+ "dregg-sig-addr",
+ "dregg-sig-asm",
+ "dregg-sig-core",
+ "dregg-sig-policy",
+ "dregg-sig-verified",
+]
+
+[[package]]
+name = "dregg-sig-fts"
+version = "0.1.0"
+dependencies = [
+ "dregg-sig-accel",
+ "dregg-sig-asm",
+ "dregg-sig-core",
+ "dregg-sig-verified",
+]
+
+[[package]]
 name = "dregg-sig-migrate"
 version = "0.1.0"
 dependencies = [
@@ -305,6 +328,28 @@ dependencies = [
  "dregg-sig-agg",
  "dregg-sig-asm",
  "dregg-sig-core",
+ "dregg-sig-quorum",
+]
+
+[[package]]
+name = "dregg-sig-policy"
+version = "0.1.0"
+dependencies = [
+ "dregg-sig-accel",
+ "dregg-sig-addr",
+ "dregg-sig-asm",
+ "dregg-sig-fts",
+ "dregg-sig-verified",
+]
+
+[[package]]
+name = "dregg-sig-quorum"
+version = "0.1.0"
+dependencies = [
+ "dregg-sig-asm",
+ "dregg-sig-core",
+ "dregg-sig-fts",
+ "dregg-sig-verified",
 ]
 
 [[package]]
@@ -932,9 +977,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 dependencies = [
  "zeroize_derive",
 ]

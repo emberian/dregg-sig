@@ -15,18 +15,19 @@ impl Drop for Field {
 }
 
 impl Field {
-    fn reduce(mut wide: [u128; 5]) -> Self {
+    fn reduce(wide: &mut [u128; 5]) -> Self {
         // Three complete carry sweeps bound every limb, including the wrap by 19.
         for _ in 0..3 {
             let mut carry = 0;
-            for limb in &mut wide {
+            for limb in wide.iter_mut() {
                 *limb += carry;
                 carry = *limb >> 51;
                 *limb &= MASK as u128;
             }
             wide[0] += carry * 19;
         }
-        let value = wide.map(|x| x as u64);
+        let mut value = wide.map(|x| x as u64);
+        dregg_sig_asm::volatile_fill(wide, 0);
         let mut diff = [0u64; 5];
         let mut borrow = 0u64;
         for ((slot, &x), &p) in diff.iter_mut().zip(&value).zip(&PRIME) {
@@ -34,17 +35,20 @@ impl Field {
             borrow = d >> 63;
             *slot = d & MASK;
         }
-        Self(limbs::ct_select(borrow == 0, diff, value))
+        let result = Self(limbs::ct_select(borrow == 0, diff, value));
+        ct_zeroize_u64s(&mut diff);
+        ct_zeroize_u64s(&mut value);
+        result
     }
 
     fn add(&self, rhs: &Self) -> Self {
-        Self::reduce(core::array::from_fn(|i| {
+        Self::reduce(&mut core::array::from_fn(|i| {
             self.0[i] as u128 + rhs.0[i] as u128
         }))
     }
 
     fn sub(&self, rhs: &Self) -> Self {
-        Self::reduce(core::array::from_fn(|i| {
+        Self::reduce(&mut core::array::from_fn(|i| {
             self.0[i] as u128 + 2 * PRIME[i] as u128 - rhs.0[i] as u128
         }))
     }
@@ -57,7 +61,7 @@ impl Field {
                 wide[(i + j) % 5] += a as u128 * b as u128 * factor;
             }
         }
-        Self::reduce(wide)
+        Self::reduce(&mut wide)
     }
 
     fn inverse(&self) -> Self {

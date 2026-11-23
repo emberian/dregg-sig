@@ -38,8 +38,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
-use dregg_sig_agg::pcs::WhirSecurityRegime;
-use dregg_sig_agg::zk_hem::protocol::{self, ZkHemError, ZkHemProof};
+use dregg_sig_agg::zk_hem::v2::params::Profile;
+use dregg_sig_agg::zk_hem::v2::protocol::{self as protocol, ZkHemV2Error, ZkHemV2Proof};
 use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape};
 
 use super::blake2::{blake2b_256, blake2b_512, blake2b_512_gadget};
@@ -62,8 +62,8 @@ type F = Goldilocks;
 
 const NOTE_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.ZCASH.NOTE/1";
 const ADDRESS_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.ZCASH.ADDR/1";
-const NOTE_PROOF_MAGIC: &[u8; 8] = b"QSHEMZN1";
-const ADDRESS_PROOF_MAGIC: &[u8; 8] = b"QSHEMZA1";
+const NOTE_PROOF_MAGIC: &[u8; 8] = b"QSHEMZN2";
+const ADDRESS_PROOF_MAGIC: &[u8; 8] = b"QSHEMZA2";
 const SIGHASH_PERSONAL: &[u8; 16] = b"QSAG_ZcashRcvSig";
 const SIGNING_NONCE_PERSONAL: &[u8; 16] = b"QSAG_ZcashRcvRnd";
 const ADDRESS_NULLIFIER_PERSONAL: &[u8; 16] = b"QSAG_ZcashAddrNf";
@@ -602,7 +602,7 @@ fn build(relation: &Relation, public_bits: &[bool], inputs: &Inputs) -> (Shape, 
     }
 
     let rows = cs.num_rows();
-    let (shape, assignment) = core::mem::take(cs).finish();
+    let (shape, assignment) = core::mem::take(cs).finish_v2();
     (shape, assignment, rows)
 }
 
@@ -670,7 +670,7 @@ pub enum RecoveryError {
     SignatureRequired,
     /// The supplied spend authorization signature does not verify under `rk`.
     BadSignature,
-    Proof(ZkHemError),
+    Proof(ZkHemV2Error),
 }
 
 // ============================================================================
@@ -879,9 +879,9 @@ impl RecoveryStatement {
         self.is_well_formed().then(|| to_field(self.public_bits()))
     }
 
-    fn transcript(&self, regime: WhirSecurityRegime) -> Vec<u8> {
+    fn transcript(&self, regime: Profile) -> Vec<u8> {
         let mut out = self.to_bytes();
-        out.push(regime as u8);
+        out.push(regime.wire_tag());
         out
     }
 
@@ -940,7 +940,7 @@ pub fn synthesize_recovery(
 }
 
 /// The statement bytes [`prove_recovery`] and [`verify_recovery`] hand to zk-Hem.
-pub fn recovery_transcript(statement: &RecoveryStatement, regime: WhirSecurityRegime) -> Vec<u8> {
+pub fn recovery_transcript(statement: &RecoveryStatement, regime: Profile) -> Vec<u8> {
     statement.transcript(regime)
 }
 
@@ -948,10 +948,10 @@ pub fn recovery_transcript(statement: &RecoveryStatement, regime: WhirSecurityRe
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryProof {
     key_tag: u8,
-    pub regime: WhirSecurityRegime,
+    pub regime: Profile,
     /// `SpendAuthSig^Orchard` signature on [`RecoveryStatement::sighash`] under `rk`.
     pub spend_auth_sig: [u8; 64],
-    pub proof: ZkHemProof,
+    pub proof: ZkHemV2Proof,
 }
 
 impl RecoveryProof {
@@ -959,7 +959,7 @@ impl RecoveryProof {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = NOTE_PROOF_MAGIC.to_vec();
         out.push(self.key_tag);
-        out.push(self.regime as u8);
+        out.push(self.regime.wire_tag());
         out.extend_from_slice(&self.spend_auth_sig);
         out.extend_from_slice(&self.proof.to_bytes());
         out
@@ -974,13 +974,14 @@ impl RecoveryProof {
         if key_tag != statement.key_source.tag() {
             return None;
         }
-        let regime = WhirSecurityRegime::from_u8(regime)?;
+        let regime = Profile::from_wire_tag(regime)?;
         let shape = recovery_shape(statement)?;
-        Some(Self {
+        let proof = ZkHemV2Proof::from_bytes(rest, &shape)?;
+        (proof.profile == regime).then_some(Self {
             key_tag,
             regime,
             spend_auth_sig: sig.try_into().ok()?,
-            proof: ZkHemProof::from_bytes(rest, &shape, regime)?,
+            proof,
         })
     }
 }
@@ -995,7 +996,7 @@ impl RecoveryProof {
 pub fn prove_recovery(
     statement: &RecoveryStatement,
     witness: &RecoveryWitness,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
     signature: Option<&[u8; 64]>,
 ) -> Result<RecoveryProof, RecoveryError> {
@@ -1045,7 +1046,7 @@ pub fn prove_recovery(
 /// documentation).
 pub fn verify_recovery(
     statement: &RecoveryStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     proof: &RecoveryProof,
 ) -> bool {
     if proof.regime != regime || proof.key_tag != statement.key_source.tag() {
@@ -1056,6 +1057,7 @@ pub fn verify_recovery(
         return false;
     };
     orchard::redpallas_verify(&statement.rk, &statement.sighash(), &proof.spend_auth_sig)
+        && proof.proof.profile == regime
         && protocol::verify(
             &shape,
             &public_inputs,
@@ -1193,9 +1195,9 @@ impl AddressStatement {
             .map(to_field)
     }
 
-    fn transcript(&self, regime: WhirSecurityRegime) -> Vec<u8> {
+    fn transcript(&self, regime: Profile) -> Vec<u8> {
         let mut out = self.to_bytes();
-        out.push(regime as u8);
+        out.push(regime.wire_tag());
         out
     }
 
@@ -1245,7 +1247,7 @@ pub fn synthesize_address(
 }
 
 /// The statement bytes [`prove_address`] and [`verify_address`] hand to zk-Hem.
-pub fn address_transcript(statement: &AddressStatement, regime: WhirSecurityRegime) -> Vec<u8> {
+pub fn address_transcript(statement: &AddressStatement, regime: Profile) -> Vec<u8> {
     statement.transcript(regime)
 }
 
@@ -1253,8 +1255,8 @@ pub fn address_transcript(statement: &AddressStatement, regime: WhirSecurityRegi
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddressProof {
     key_tag: u8,
-    pub regime: WhirSecurityRegime,
-    pub proof: ZkHemProof,
+    pub regime: Profile,
+    pub proof: ZkHemV2Proof,
 }
 
 impl AddressProof {
@@ -1262,7 +1264,7 @@ impl AddressProof {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = ADDRESS_PROOF_MAGIC.to_vec();
         out.push(self.key_tag);
-        out.push(self.regime as u8);
+        out.push(self.regime.wire_tag());
         out.extend_from_slice(&self.proof.to_bytes());
         out
     }
@@ -1275,12 +1277,13 @@ impl AddressProof {
         if key_tag != statement.key_source.tag() {
             return None;
         }
-        let regime = WhirSecurityRegime::from_u8(regime)?;
+        let regime = Profile::from_wire_tag(regime)?;
         let shape = address_shape(statement)?;
-        Some(Self {
+        let proof = ZkHemV2Proof::from_bytes(rest, &shape)?;
+        (proof.profile == regime).then_some(Self {
             key_tag,
             regime,
-            proof: ZkHemProof::from_bytes(rest, &shape, regime)?,
+            proof,
         })
     }
 }
@@ -1289,7 +1292,7 @@ impl AddressProof {
 pub fn prove_address(
     statement: &AddressStatement,
     witness: &AddressWitness,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
 ) -> Result<AddressProof, RecoveryError> {
     let (shape, assignment) = synthesize_address(statement, witness)?;
@@ -1311,7 +1314,7 @@ pub fn prove_address(
 /// Verify an address ownership proof under the regime the verifier requires.
 pub fn verify_address(
     statement: &AddressStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     proof: &AddressProof,
 ) -> bool {
     if proof.regime != regime || proof.key_tag != statement.key_source.tag() {
@@ -1321,13 +1324,14 @@ pub fn verify_address(
     else {
         return false;
     };
-    protocol::verify(
-        &shape,
-        &public_inputs,
-        &statement.transcript(regime),
-        regime,
-        &proof.proof,
-    )
+    proof.proof.profile == regime
+        && protocol::verify(
+            &shape,
+            &public_inputs,
+            &statement.transcript(regime),
+            regime,
+            &proof.proof,
+        )
 }
 
 /// Row counts of a relation before padding, for reports: `(rows, variables)`.
@@ -1350,7 +1354,7 @@ mod tests {
     use std::println;
     use std::string::String;
 
-    const REGIME: WhirSecurityRegime = WhirSecurityRegime::BciksJohnsonQrom128;
+    const REGIME: Profile = Profile::TurboShakeJohnson400;
     const PQ: [u8; 32] = [0x51; 32];
     const DOMAIN: [u8; 32] = [0x44; 32];
     const EPOCH: u64 = 7;
@@ -2009,7 +2013,7 @@ mod tests {
         // Another regime, a bad signature, tampered proof bytes.
         assert!(!verify_recovery(
             &st,
-            WhirSecurityRegime::Cdhz25JohnsonQrom128,
+            Profile::CshakeJohnson400,
             &proof
         ));
         let mut bad = proof.clone();
@@ -2134,13 +2138,13 @@ mod tests {
                       verify_cold_s: f64,
                       verify_warm_ms: f64,
                       proof_bytes: usize| {
-            let layout = protocol::Layout::new(shape, REGIME).unwrap();
+            let layout = protocol::layout_of(shape).unwrap();
             println!(
                 "HEM_ZCASH statement=\"{name}\" regime={} rows={rows} padded_rows=2^{} vars={} \
                  public_inputs={} cells=2^{} synth_s={synth_s:.2} prove_s={prove_s:.2} \
                  verify_cold_s={verify_cold_s:.2} verify_warm_ms={verify_warm_ms:.1} \
                  proof_bytes={proof_bytes} proof_kib={:.1} peak_rss_mib={}",
-                REGIME as u8,
+                REGIME.wire_tag(),
                 shape.log_rows,
                 shape.num_vars,
                 shape.num_public,

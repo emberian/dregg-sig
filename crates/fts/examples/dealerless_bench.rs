@@ -1,4 +1,4 @@
-//! Production RLWE/OT-extension/Gilboa DKG benchmark; argument: power count, tree height.
+//! Production RLWE/KOS/Gilboa DKG benchmark; argument: power count, tree height.
 //! Times preprocessing plus activation, not public leaf evaluation.
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};

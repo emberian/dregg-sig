@@ -259,14 +259,18 @@ fn help_info_and_usage_errors() {
         "\"signature_bytes\": 1122",
         "fts-threshold",
         "agg-jorts-poseidon2",
-        "GoldilocksExt4",
+        "QuinticFp5",
         "WHIR",
-        "CanopyMultiProof",
+        "QSAGHQM2",
         "qsag-migration-proof-v2",
         "\"kind\": \"btc-hash160\"",
         "\"kind\": \"eth-eoa\"",
         "\"kind\": \"ed25519\"",
         "\"kind\": \"bip32-secp256k1\"",
+        "\"kind\": \"ironwood\"",
+        "\"kind\": \"orchard\"",
+        "\"kind\": \"sapling\"",
+        "\"kind\": \"zcash-transparent\"",
     ] {
         assert!(info.contains(needle), "info lacks {needle}");
     }
@@ -625,7 +629,7 @@ fn threshold_few_time_signature_burns_each_epoch_once() {
 }
 
 #[test]
-fn aggregate_merge_verify_and_tamper() {
+fn aggregate_quintic_verify_and_tamper() {
     let dir = Workdir::new("agg");
     let wal = dir.path("wal");
     let pass = dir.path("pass");
@@ -648,10 +652,10 @@ fn aggregate_merge_verify_and_tamper() {
         dir.path("msg"),
         dir.path("other"),
     );
-    let (proof_a, proof_b, merged) = (
+    let (proof_a, proof_b, full_proof) = (
         dir.path("a.proof"),
         dir.path("b.proof"),
-        dir.path("merged.proof"),
+        dir.path("full.proof"),
     );
     let sign = |signers: &str, epoch: &str, input: &str, out: &str, expected: i32| {
         expect(
@@ -711,27 +715,9 @@ fn aggregate_merge_verify_and_tamper() {
     sign("0", "0", &other, &dir.path("equivocation.proof"), 4);
     assert!(!Path::new(&dir.path("equivocation.proof")).exists());
     sign("2,1", "1", &msg, &dir.path("unordered.proof"), 1);
-    // A deleted write-ahead log is not treated as an unused key.
-    std::fs::remove_file(Path::new(&wal).join("validator-3.wal")).unwrap();
-    sign("3", "1", &msg, &dir.path("lost-wal.proof"), 4);
 
-    let pair = format!("{proof_a},{proof_b}");
-    let out = expect(
-        &[
-            "aggregate",
-            "--merge",
-            &pair,
-            "--public",
-            &pk,
-            "--in",
-            &msg,
-            "--out",
-            &merged,
-            "--json",
-        ],
-        0,
-    );
-    assert!(out.contains("\"leaf_shards\": 2"));
+    // Epoch 1 full-committee Quintic Fp5 (`QSAGHQM2`) proof across all 4 validators.
+    sign("0,1,2,3", "1", &msg, &full_proof, 0);
     assert!(
         expect(
             &[
@@ -741,30 +727,33 @@ fn aggregate_merge_verify_and_tamper() {
                 "--in",
                 &msg,
                 "--proof",
-                &merged
+                &full_proof
             ],
             0
         )
         .contains("4 of 4")
     );
-    // Overlapping signer sets can not be merged.
-    let overlap = format!("{proof_a},{merged}");
+    // Retired `--merge` flag must be rejected as an unknown option.
     expect(
         &[
             "aggregate",
             "--merge",
-            &overlap,
+            &format!("{proof_a},{proof_b}"),
             "--public",
             &pk,
             "--in",
             &msg,
             "--out",
-            &dir.path("overlap.proof"),
+            &dir.path("retired-merge.proof"),
         ],
-        2,
+        1,
     );
 
-    flip_hex_digit(&merged, "proof");
+    // A deleted write-ahead log is not treated as an unused key.
+    std::fs::remove_file(Path::new(&wal).join("validator-3.wal")).unwrap();
+    sign("3", "2", &msg, &dir.path("lost-wal.proof"), 4);
+
+    flip_hex_digit(&full_proof, "proof");
     expect(
         &[
             "verify-agg",
@@ -773,7 +762,7 @@ fn aggregate_merge_verify_and_tamper() {
             "--in",
             &msg,
             "--proof",
-            &merged,
+            &full_proof,
         ],
         2,
     );
@@ -5231,7 +5220,7 @@ fn migrate_registry_records_each_credential_once() {
         "7",
         &["--path", "m/44'/0'/0'/0/0"],
     );
-    assert!(std::fs::metadata(&deep).unwrap().len() > 1 << 20);
+    assert!(std::fs::metadata(&deep).unwrap().len() > 500_000);
     run(
         &[
             "migrate", "registry", "register", "--proof", &deep, "--epoch", "7",
@@ -5630,4 +5619,193 @@ fn enrollment_preflights_party_files_before_external_anchor_provisioning() {
         );
         assert_eq!(std::fs::read_dir(&anchor).unwrap().count(), 0);
     }
+}
+
+#[test]
+fn migrate_zcash_transparent_orchard_and_ironwood_claim_prove_verify_and_register() {
+    let dir = Workdir::new("migrate-zcash");
+    let target = migration_target(&dir, "target");
+    let write = |name: &str, contents: &str| {
+        let path = dir.path(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    };
+    let secp = write("secp.hex", &format!("{SECP_KEY_ONE}\n"));
+    let orchard_sk = write("orchard.hex", &"21".repeat(32));
+    let ironwood_json = write(
+        "ironwood.json",
+        &format!(
+            "{{\n  \"spending_key\": \"{}\",\n  \"alpha\": \"09{}\",\n  \"value\": 125000000,\n  \"rho\": \"07{}\",\n  \"rseed\": \"{}\"\n}}\n",
+            "41".repeat(32),
+            "00".repeat(31),
+            "00".repeat(31),
+            "55".repeat(32),
+        ),
+    );
+
+    let registry = dir.path("zcash-registry");
+    expect(
+        &[
+            "migrate",
+            "registry",
+            "init",
+            "--registry-dir",
+            &registry,
+            "--ephemeral-unanchored",
+        ],
+        0,
+    );
+
+    for (alias, canonical, secret, member) in [
+        ("zip2007-t1", "zcash-transparent", secp.as_str(), "legacy_zcash_address"),
+        ("orchard", "orchard", orchard_sk.as_str(), "legacy_orchard_address"),
+        ("zip2005", "ironwood", ironwood_json.as_str(), "anchor"),
+    ] {
+        let claim = dir.path(&format!("{canonical}-claim.json"));
+        expect(
+            &[
+                "migrate",
+                "claim",
+                "--kind",
+                alias,
+                "--legacy-secret",
+                secret,
+                "--target",
+                &target,
+                "--epoch",
+                "99",
+                "--out",
+                &claim,
+            ],
+            0,
+        );
+        let claim_text = std::fs::read_to_string(&claim).unwrap();
+        assert_eq!(json_member(&claim_text, "kind"), canonical);
+        assert_eq!(json_member(&claim_text, "key_exposure"), "hidden");
+        assert!(!json_member(&claim_text, member).is_empty());
+
+        let proof = migrate_prove(
+            &dir,
+            &format!("{canonical}-proof.json"),
+            alias,
+            secret,
+            &target,
+            "99",
+            &[],
+        );
+        let proof_text = std::fs::read_to_string(&proof).unwrap();
+        assert_eq!(json_member(&proof_text, "regime"), "TurboShakeJohnson400");
+        assert_eq!(
+            json_member(&proof_text, "statement"),
+            json_member(&claim_text, "statement")
+        );
+
+        let verified = expect(
+            &[
+                "migrate",
+                "verify",
+                "--register",
+                "--registry-dir",
+                &registry,
+                "--proof",
+                &proof,
+                "--epoch",
+                "99",
+                "--target",
+                &target,
+                "--json",
+            ],
+            0,
+        );
+        assert_eq!(json_member(&verified, "valid"), "true");
+        assert_eq!(json_member(&verified, "status"), "finalized");
+        assert_eq!(json_member(&verified, "appended"), "true");
+    }
+
+    // Sapling claim & help check (`sapling` / `zcash-sapling`)
+    let sapling_sk = write("sapling.hex", &"31".repeat(32));
+    let sapling_claim = dir.path("sapling-claim.json");
+    expect(
+        &[
+            "migrate",
+            "claim",
+            "--kind",
+            "zcash-sapling",
+            "--legacy-secret",
+            &sapling_sk,
+            "--target",
+            &target,
+            "--epoch",
+            "99",
+            "--out",
+            &sapling_claim,
+        ],
+        0,
+    );
+    let sapling_claim_text = std::fs::read_to_string(&sapling_claim).unwrap();
+    assert_eq!(json_member(&sapling_claim_text, "kind"), "sapling");
+    assert!(!json_member(&sapling_claim_text, "legacy_sapling_address").is_empty());
+}
+
+#[test]
+fn quintic_public_cli_roundtrip() {
+    use dregg_sig_agg::sig::digest4_to_bytes;
+    use dregg_sig_agg::{AggSigProfile, FsWalEpochSink, ValidatorKeypair};
+
+    let dir = Workdir::new("quintic-public");
+    let mut kp = ValidatorKeypair::keygen_deterministic(AggSigProfile::JortsPoseidon2, &[7; 32], 0);
+    let (mut wal, _) = FsWalEpochSink::create_new_for_fresh_key(
+        dir.path("validator.wal"),
+        &digest4_to_bytes(&kp.pk.pk_root),
+        [8; 32],
+    )
+    .unwrap();
+    let msg = dir.path("msg");
+    let pk = dir.path("pk");
+    let signature = dir.path("signature");
+    let proof = dir.path("aggregate");
+    let sig = kp
+        .sign_stateful(&std::fs::read(&msg).unwrap(), 0, &mut wal)
+        .unwrap();
+    std::fs::write(&pk, kp.pk.to_bytes()).unwrap();
+    std::fs::write(&signature, sig.to_bytes()).unwrap();
+    expect(
+        &[
+            "aggregate",
+            "--pubkeys",
+            &pk,
+            "--signers",
+            "0",
+            "--sigs",
+            &signature,
+            "--message",
+            &msg,
+            "--hem-profile",
+            "quintic-turbo",
+            "--out",
+            &proof,
+        ],
+        0,
+    );
+    let verify = |message: &str, profile: &str, code| {
+        expect(
+            &[
+                "verify-aggregate",
+                "--pubkeys",
+                &pk,
+                "--message",
+                message,
+                "--proof",
+                &proof,
+                "--hem-profile",
+                profile,
+            ],
+            code,
+        );
+    };
+    verify(&msg, "quintic-turbo", 0);
+    verify(&dir.path("other"), "quintic-turbo", 2);
+    verify(&msg, "quintic-gl24", 2);
+    flip_hex_digit(&proof, "proof");
+    verify(&msg, "quintic-turbo", 2);
 }

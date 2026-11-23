@@ -42,8 +42,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use dregg_sig_agg::pcs::WhirSecurityRegime;
-use dregg_sig_agg::zk_hem::protocol::{self, ZkHemProof};
+use dregg_sig_agg::zk_hem::v2::params::Profile;
+use dregg_sig_agg::zk_hem::v2::protocol::{self as protocol, ZkHemV2Proof};
 
 use super::encoding::{Network, TransparentKind, decode_transparent, encode_transparent};
 use crate::hem::relations::{
@@ -52,7 +52,7 @@ use crate::hem::relations::{
 };
 
 const STATEMENT_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.ZCASH.TADR/1";
-const PROOF_MAGIC: &[u8; 8] = b"QSHEMZT1";
+const PROOF_MAGIC: &[u8; 8] = b"QSHEMZT2";
 
 /// Registry tag of a Zcash transparent P2PKH address (network byte, then the payload).
 pub const LEGACY_TAG_TRANSPARENT_P2PKH: u8 = 18;
@@ -240,9 +240,9 @@ impl TransparentStatement {
         statement.is_well_formed().then_some(statement)
     }
 
-    fn transcript(&self, regime: WhirSecurityRegime) -> Vec<u8> {
+    fn transcript(&self, regime: Profile) -> Vec<u8> {
         let mut out = self.to_bytes();
-        out.push(regime as u8);
+        out.push(regime.wire_tag());
         out
     }
 
@@ -268,15 +268,15 @@ impl TransparentStatement {
 /// A transparent ownership proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransparentProof {
-    pub regime: WhirSecurityRegime,
-    pub proof: ZkHemProof,
+    pub regime: Profile,
+    pub proof: ZkHemV2Proof,
 }
 
 impl TransparentProof {
     /// `magic(8) || regime || zk-Hem proof`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = PROOF_MAGIC.to_vec();
-        out.push(self.regime as u8);
+        out.push(self.regime.wire_tag());
         out.extend_from_slice(&self.proof.to_bytes());
         out
     }
@@ -288,11 +288,12 @@ impl TransparentProof {
         if !statement.is_well_formed() {
             return None;
         }
-        let regime = WhirSecurityRegime::from_u8(regime)?;
+        let regime = Profile::from_wire_tag(regime)?;
         let shape = ownership_shape(&statement.ownership)?;
-        Some(Self {
+        let proof = ZkHemV2Proof::from_bytes(rest, &shape)?;
+        (proof.profile == regime).then_some(Self {
             regime,
-            proof: ZkHemProof::from_bytes(rest, &shape, regime)?,
+            proof,
         })
     }
 }
@@ -301,7 +302,7 @@ impl TransparentProof {
 pub fn prove_transparent(
     statement: &TransparentStatement,
     witness: &OwnershipWitness,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
 ) -> Result<TransparentProof, OwnershipError> {
     if !statement.is_well_formed() {
@@ -322,7 +323,7 @@ pub fn prove_transparent(
 /// Verify a proof against a statement under the regime the verifier requires.
 pub fn verify_transparent(
     statement: &TransparentStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     proof: &TransparentProof,
 ) -> bool {
     if !statement.is_well_formed() || proof.regime != regime {
@@ -334,13 +335,14 @@ pub fn verify_transparent(
     ) else {
         return false;
     };
-    protocol::verify(
-        &shape,
-        &public_inputs,
-        &statement.transcript(regime),
-        regime,
-        &proof.proof,
-    )
+    proof.proof.profile == regime
+        && protocol::verify(
+            &shape,
+            &public_inputs,
+            &statement.transcript(regime),
+            regime,
+            &proof.proof,
+        )
 }
 
 #[cfg(test)]
@@ -349,7 +351,7 @@ mod tests {
     use super::*;
     use crate::hem::relations::{OwnershipProof, bip32_derive, prove_ownership, verify_ownership};
 
-    const REGIME: WhirSecurityRegime = WhirSecurityRegime::BciksJohnsonQrom128;
+    const REGIME: Profile = Profile::TurboShakeJohnson400;
     const PQ: [u8; 32] = [0x51; 32];
     const DOMAIN: [u8; 32] = [0x2c; 32];
     const EPOCH: u64 = 7;
@@ -613,7 +615,7 @@ mod tests {
             }
             assert!(!verify_transparent(
                 &st,
-                WhirSecurityRegime::Cdhz25JohnsonQrom128,
+                Profile::CshakeJohnson400,
                 &proof
             ));
             for at in [8, bytes.len() / 2, bytes.len() - 1] {

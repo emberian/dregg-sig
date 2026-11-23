@@ -223,8 +223,21 @@ pub const SCALAR_MODULUS_LE: [u8; 32] = [
 macro_rules! field {
     ($name:ident, $params:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[derive(Clone, Copy)]
         pub struct $name(U256);
+
+        impl PartialEq for $name {
+            fn eq(&self, rhs: &Self) -> bool {
+                crate::limbs::ct_eq(self.0, rhs.0)
+            }
+        }
+        impl Eq for $name {}
+
+        impl dregg_sig_core::wipe::SecretWipe for $name {
+            fn secret_wipe(&mut self) {
+                dregg_sig_asm::volatile_fill(&mut self.0, 0);
+            }
+        }
 
         impl core::fmt::Debug for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -295,12 +308,9 @@ macro_rules! field {
 
             /// `a` when `flag`, else `b`, without branching on `flag`.
             pub fn select(flag: bool, a: Self, b: Self) -> Self {
-                Self(select(mask(flag), &a.0, &b.0))
+                Self(crate::limbs::ct_select(flag, a.0, b.0))
             }
 
-            pub(crate) fn words(self) -> [u64; 4] {
-                self.0
-            }
         }
 
         impl core::ops::Add for $name {
@@ -373,7 +383,7 @@ impl Fq {
     /// The scalar with the same integer value as a base field element (`p < q`, so every
     /// base field element is a canonical scalar).
     pub fn from_base(x: Fp) -> Self {
-        Self(x.words())
+        Self(x.0)
     }
 }
 
@@ -415,6 +425,11 @@ impl Point {
     /// The point with these affine coordinates; `None` if they are not on the curve.
     pub fn from_affine(x: Fp, y: Fp) -> Option<Self> {
         (y.square() == x.square() * x + B).then_some(Self { x, y, z: Fp::ONE })
+    }
+
+    /// Sinsemilla excludes infinity and coincident affine x coordinates.
+    pub(super) fn incomplete_add_defined(&self, rhs: &Self) -> bool {
+        !self.is_identity() & !rhs.is_identity() & (self.x * rhs.z != rhs.x * self.z)
     }
 
     pub fn is_identity(&self) -> bool {
@@ -486,7 +501,7 @@ impl Point {
 
     /// `[k] self`; branch-free in `k`.
     pub fn mul(&self, k: &Fq) -> Self {
-        self.mul_words(&k.words())
+        self.mul_words(&k.0)
     }
 
     /// Affine coordinates; `None` for the identity.
@@ -524,15 +539,14 @@ impl Point {
 
     /// `Extract_P`: the affine `x` coordinate, or zero for the identity.
     pub fn extract(&self) -> Fp {
-        self.to_affine().map_or(Fp::ZERO, |(x, _)| x)
+        self.x * self.z.invert()
     }
 
     /// `repr_P`: little-endian `x` with the parity of `y` in the top bit; all zero for the
     /// identity.
     pub fn to_bytes(&self) -> [u8; 32] {
-        let Some((x, y)) = self.to_affine() else {
-            return [0; 32];
-        };
+        let zi = self.z.invert();
+        let (x, y) = (self.x * zi, self.y * zi);
         let mut out = x.to_bytes();
         out[31] |= (y.is_odd() as u8) << 7;
         out

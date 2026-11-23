@@ -17,7 +17,7 @@ fn default_consumer_cannot_access_retired_oracles() {
     let _cleanup = Cleanup(dir.clone());
     let dependency = env!("CARGO_MANIFEST_DIR").replace('\\', "\\\\");
     fs::write(dir.join("Cargo.toml"), format!(
-        "[package]\nname = \"credential-gate-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\nqsag-cred = {{ path = {dependency:?} }}\n"
+        "[package]\nname = \"credential-gate-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\ndregg-sig-cred = {{ path = {dependency:?} }}\n"
     )).unwrap();
     fs::create_dir(dir.join("src")).unwrap();
     fs::write(

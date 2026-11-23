@@ -1,266 +1,92 @@
-# Migration security scope
+# Migration Security Scope (`dregg-sig-migrate` over `zk-Hem v2`)
 
 `dregg-sig-migrate` lets the holder of a legacy credential state "this post-quantum
 address is mine" in a way a verifier can check without learning the legacy secret. It
-has three parts: ownership statements and their proofs (`hem::relations`), a durable
-one-way registry of accepted migrations (`hem::registry`), and work towards proving
-from a secret-shared witness (`hem::collab`).
+comprises four subsystems:
 
-The earlier proof system of this crate (438-repetition ZKBoo, with a replicated and an
-authenticated distributed prover, and Pallas and BLS12-381 relations) has been removed.
-Its proofs (`qsag-migration-proof-v1`) are not accepted by anything in this tree.
+1. **Multi-chain ownership statements and `zk-Hem v2` proofs (`hem::relations`):**
+   Bitcoin (`P2PKH`, uncompressed `P2PKH`, `P2SH-P2WPKH`, `Taproot` key-path and
+   script-tree), Ethereum (`Keccak256` EOA and `0x00` `BLS12-381` withdrawal credentials),
+   Ed25519 (RFC 8032 seed, `SLIP-0010`, and `BIP32-Ed25519` Khovratovich–Law), `BIP-32`
+   master seeds & extended keys (public or hidden derivation paths), and `BatchStatement`
+   shared-prefix multi-address proofs (`QSHEMOW2`).
+2. **Zcash NU7 `v2026.9.0` statements (`hem::zcash`):**
+   - `ZIP-2005` Ironwood quantum-recoverable shielded note recovery (`RecoveryStatement` /
+     `RecoveryProof`, `QSHEMZN2`, lead byte `0x03`, BLAKE2s rehashed tree + `RedPallas`
+     `SpendAuthSig`),
+   - Orchard diversified payment address ownership (`AddressStatement` / `AddressProof`,
+     `QSHEMZA2`),
+   - Sapling diversified payment address ownership over Jubjub (`SaplingAddressStatement` /
+     `SaplingAddressProof`, `QSHEMZS2`),
+   - `ZIP-2007` transparent `t1` / `tm` P2PKH ownership (`TransparentStatement` /
+     `TransparentProof`, `QSHEMZT2`).
+3. **Durable one-way nullifier registry (`hem::registry`):**
+   Append-only authenticated turnstile (`TwoSlotHwm` + inode-bound MAC chain + optional
+   hardware/TPM/filesystem `ExternalMonotoneAnchor`) enforcing at-most-once migration per
+   nullifier and per on-chain legacy credential identifier.
+4. **Threshold collaborative prover (`hem::collab`):**
+   Quorum proving over MAC-authenticated additive shares (`Sb`, `Sh` over `Fp5`) from
+   `(k, n)` Shamir or XOR custody shares without reconstructing the legacy secret on any
+   host, using **9-triple Toom-3 `Fp5` Beaver multiplication** (`9` base triples per
+   quintic product — 43.75% fewer triples than `Fp4` schoolbook's 16) and **pre-round-1
+   anti-rollback preprocessing burn** (`Engine::new_anchored` / `prove_ownership_party_anchored`;
+   unanchored constructors are sealed to `#[cfg(test)]`) so every public collaborative MPC
+   session is transcript- and monotone-counter-anchored by construction and an
+   aborted ceremony can never reuse MAC key shares or Beaver triples.
+
+The legacy 438-repetition ZKBoo migration engine (`qsag-migration-proof-v1`) and the
+256-bit-digest `zk-Hem v1` hiding wrapper have been retired; all proofs use `zk-Hem v2`
+(`dregg_sig_agg::zk_hem::v2`, 400-bit digests, 32-byte per-tree `tree_nonce`, `QuinticGoldilocks`,
+DKT26 `2026/2056` Theorem 5.12 line- vs-subcode soundness).
 
 ## What a proof shows, and what it does not
 
 A valid proof shows that whoever made it knew a secret behind the legacy credential and
-chose the target address, the migration domain and the epoch of the statement.
+chose the target post-quantum address, the migration domain, and the epoch of the statement.
 
-It does not show that the prover is the rightful owner: anyone who holds the secret can
-prove. It does not disable the legacy key: a migrated Bitcoin or Ethereum key still
-signs valid legacy transactions until the chain itself stops accepting them. It does not
-prevent a second migration of the same credential to another address: two proofs for
-two targets are both valid. Disabling legacy spending is the chain's job; refusing the
-second migration is the job of whatever records migrations, here the registry. A
-verifier that only checks proofs and keeps no state has neither property.
+It does not disable the legacy key on the origin chain, and two proofs for different
+targets are both valid unless recorded in a stateful turnstile (`NullifierRegistry` or
+consensus state).
 
-## Statements
+### Hidden-key vs. revealed-key statements
 
-A statement (`OwnershipStatement`) is a lock, a key source, the on-chain credential, a
-commitment to the target address (`registry::pq_commitment`: prefix, version, suite,
-key kind and key commitment), a 32-byte migration domain, an epoch and a nullifier. The
-credential, the nullifier and a SHA-256 chaining value carrying the domain and the
-credential identifier are public inputs of the relation. The target commitment and the
-epoch are not inside the relation; they are bound through the proof transcript, which
-absorbs the whole canonical statement encoding and the regime. A proof for one target,
-domain or epoch does not verify for another.
+* **Hidden-key statements** (`Secp256k1Key`, `Bls12381Key`, `Taproot` internal key,
+  Zcash `t1` hidden key) prove knowledge of a discrete-logarithm scalar hidden behind an
+  on-chain hash (`HASH160`, `Keccak256`, `TapTweak`, `0x00 || SHA256`). They are
+  post-quantum sound only while the raw public key has never been revealed on chain.
+  20-byte `HASH160` / `Keccak256[12..]` addresses carry an inherent 160-bit classical /
+  80-bit Grover preimage ceiling from the legacy address format itself.
+* **Revealed-key / seed-provenance statements** (`Ed25519Seed`, `Bip32` seed root,
+  `Slip10`, Zcash `ZIP-2005` Ironwood `0x03`, Orchard/Sapling `sk` or `ZIP-32` seed)
+  prove knowledge of a hash preimage (`SHA-512`, `HMAC-SHA512`, `BLAKE2b`, `BLAKE2s`).
+  Computing discrete logarithms on chain does not invert those hashes. Extended-key
+  roots (`Bip32Root::ExtendedKey`, `Bip32Ed25519`) are sound only while no extended
+  public key at or above the root node has been exported (ePrint 2026/1508 Prop. 6.1).
 
-The lock says how the chain derives the credential from a public key:
+## Proof system (`zk-Hem v2`)
 
-| Lock | Credential |
-| --- | --- |
-| `P2pkh` | `HASH160(compressed key)` (P2PKH, P2WPKH) |
-| `P2pkhUncompressed` | `HASH160(04 \|\| x \|\| y)` |
-| `P2shP2wpkh` | `HASH160(00 14 \|\| HASH160(compressed key))` |
-| `Ethereum` | `Keccak256(x \|\| y)[12..]` |
-| `TaprootKeyPath` | x of `lift_x(P) + H_TapTweak(x(P)) G` (BIP-86) |
-| `TaprootScriptTree` | x of `lift_x(P) + H_TapTweak(x(P) \|\| root) G`, the merkle root in the witness |
-| `Ed25519` | the public key |
-| `BlsWithdrawal` | `00 \|\| SHA256(compressed G1 key)[1..]` |
+All single-prover (`ZkHemV2Proof`, `QSAGZKH2`) and collaborative split-share
+(`ZkHemV2SplitProof`, `QSAGZKS2`) proofs run over `dregg_sig_agg::zk_hem::v2` under
+`Profile::TurboShakeJohnson400` (or `Profile::CshakeJohnson400`):
 
-The key source says what the prover knows:
+* **Field:** `QuinticGoldilocks` (`Fp5 = F_p[u] / (u^5 - 3)`, ~320-bit extension).
+* **Commitments:** 400-bit Merkle digests (~133-bit QROM collision resistance) with a
+  32-byte per-tree `tree_nonce` absorbed into every Stage-0 leaf (`|D'|`-independent
+  multi-tree salt security) and 16-bit proof-of-work.
+* **Soundness:** Dao–Kominers–Thaler (`2026/2056`) Theorem 5.12 line-point soundness
+  across `N <= 2^28` with 266 Stage-0 queries (`>= 128` bits classical & quantum
+  round-by-round soundness; see `crates/agg/SECURITY.md` §V2).
 
-| Source | Witness | Mode |
-| --- | --- | --- |
-| `Secp256k1Key`, `Bls12381Key` | the secret key, in `1..n` | hidden |
-| `Ed25519Seed` | the RFC 8032 seed | revealed |
-| `Bip32`, seed root | master seed of 16 to 64 bytes (length hidden), path of at most 10 steps | revealed |
-| `Bip32`, extended-key root | a private key and its chain code, path | revealed, see below |
-| `Slip10` | SLIP-0010 master seed, all-hardened path | revealed |
-| `Bip32Ed25519` | a Khovratovich-Law extended private key (96 bytes), public path | revealed, see below |
+## Threshold collaborative proving (`hem::collab`)
 
-Any lock of a curve combines with any source of that curve. A path is public, or
-hidden up to a public maximum depth (indices, hardened flags and depth in the
-witness). `BatchStatement` proves many credentials below one BIP-32 node in one proof;
-each entry is the same claim as the corresponding single statement.
-
-### Hidden-key statements
-
-The key-source statements prove knowledge of the signing scalar. They mean something
-only while the public key is not known to an attacker who can compute discrete
-logarithms: once the key has appeared on chain (any spend from the address, or address
-reuse), such an attacker computes `k` and can produce the same proof. These statements
-are for credentials whose public key has never been published.
-
-A Taproot output key is always public. The hidden-key Taproot statement is knowledge
-of an internal key `k` with `Q = lift_x([k]G) + H_TapTweak(..) G`; the internal key is
-under the hash, so the logarithm of `Q` does not give a witness. That statement fails
-once the internal key has been published (a script-path spend, an exported extended
-public key). With a script tree, the witness also holds the merkle root, which is not
-checked against any script.
-
-The 20-byte credentials commit to a 160-bit value. Finding some key whose public key
-hashes to a given 160-bit address is a preimage search of about `2^160` classical and
-about `2^80` quantum (Grover) evaluations of a scalar multiplication and a hash. No
-proof system raises that ceiling: it belongs to the address format.
-
-### Revealed-key statements
-
-The other sources take a hash preimage as the witness. An attacker who computes the
-signing scalar from the public key still has to invert SHA-512, or HMAC-SHA512 along
-the derivation path, to satisfy them. They apply only to keys that were derived this
-way and whose seed the holder still has.
-
-A seed-rooted statement is sound whatever has been published. A statement rooted at an
-extended private key (`Bip32Root::ExtendedKey`, and every `Bip32Ed25519` statement) is
-sound only while no extended public key at or above its root node has been exported:
-the chain code from such an export and the discrete logarithm of the node's public key
-are the whole witness. This is the unsoundness of last-step proofs of ePrint 2026/1508
-(Proposition 6.1). For the BIP-32 master node the condition is the usual state of a
-wallet, and the statement is 87,000 rows smaller. BIP32-Ed25519 has no seed-rooted
-form because its deployed root derivations (Cardano Icarus: PBKDF2 with 4096
-iterations) are not provable at a usable size.
-
-EIP-2333 seed provenance for BLS keys is not offered: one `derive_child_SK` measures
-30.8 million rows and the EIP-2334 withdrawal path has four (123 million rows), beyond
-the largest supported commitment.
-
-BIP-39 is outside the relation. The witness is the master seed, which for a BIP-39
-wallet is the 64-byte output of PBKDF2 over the mnemonic and passphrase
-(`relations::bip39_seed`). Proving that step (about 180 million rows) would add
-nothing: the seed is already a secret no public value determines, and whoever holds
-the mnemonic holds the seed.
-
-### Nullifier and credential identifier
-
-The registry keeps the credential identifier unique (`Credential::identifier`, a digest
-of the credential type and its on-chain bytes), so one on-chain credential migrates
-once, whichever statement kind proves it. Two credentials of one key (its `HASH160`
-and its Ethereum address) are two identifiers and migrate independently.
-
-The nullifier is `SHA256(tag || kind || 00 00 || domain || identifier || 0^32 ||
-secret)`. The secret is the signing key for a hidden-key statement, and seed material
-for a revealed-key statement: the inner digest of the master HMAC (BIP-32 from a seed),
-the leaf's RFC 8032 seed (Ed25519, SLIP-0010), the leaf's `k_R` (BIP32-Ed25519), the
-root chain code (extended-key root). For a revealed key it is therefore not computable
-from public keys and discrete logarithms, so an attacker cannot predict or pre-register
-it. It cannot also be the same value for a hidden-key statement and a seed statement of
-one key: a hidden-key witness is the scalar alone, so a common nullifier would be a
-function of the scalar. Those two statements of one credential have different
-nullifiers and the same identifier, and the registry refuses the second by the
-identifier. The nullifier of a hidden key lets anyone test a guessed key, exactly as
-the address does.
-
-## Proof system
-
-Proofs are zk-Hem proofs (`dregg_sig_agg::zk_hem::protocol`) of a relation with
-multiplication rows only, over the Hem WHIR commitment, under the regime
-`BciksJohnsonQrom128` (wire tag 4): 258, 130, 88 and 66 queries at blowups 4, 16, 64
-and 256, a 16-bit proof of work, cSHAKE256 Merkle trees and transcript. The regime's
-nominal figure is 272 bits of per-round Fiat-Shamir soundness, 136 bits of single-round
-Grover work. That is a per-round query budget, not a composed security bound.
-
-The security status is the one stated in `crates/agg/SECURITY.md` and on
-`zk_hem::protocol::prove`, and it applies here without change. Not established:
-
-- a composed simulator for the cell layout and transcript: zero knowledge of the
-  complete protocol is argued from masking ingredients, not proved;
-- a bound for hiding the unopened salted Stage-0 leaves;
-- the proximity loss of the scalar companion batching under the regime's query schedule;
-- a concrete knowledge-soundness bound for the composition (masked sumchecks, linear
-  batching, companion challenge, WHIR).
-
-In addition, the relations of this crate (the SHA-256, SHA-512, HMAC, RIPEMD-160 and
-Keccak gadgets of `hem::hash` and the non-native secp256k1 and Ed25519 arithmetic of
-`hem::curve`) are tested against the native references and standard vectors and have
-not been formally verified or independently reviewed. Proving is not claimed to be
-constant-time; run the prover on a host that is trusted with the secret. The proof
-randomness must be uniform and secret: it determines every mask and blinder.
-
-Measured with `hem::relations::tests::measure_ownership_proofs` (22-core x86-64 Linux
-host, release profile, regime `BciksJohnsonQrom128`; verification with the relation's
-shape cached):
-
-| Statement | Rows | Proof bytes | Prove | Verify |
-| --- | ---: | ---: | ---: | ---: |
-| P2PKH / P2WPKH, key | 81,977 | 514,444 | 0.6 s | 22 ms |
-| P2SH-P2WPKH, key | 114,603 | 514,412 | 0.6 s | 21 ms |
-| Ethereum address, key | 140,975 | 530,188 | 1.0 s | 27 ms |
-| Taproot key path, key | 98,986 | 512,332 | 0.7 s | 23 ms |
-| Taproot script tree, key | 112,375 | 513,772 | 0.7 s | 24 ms |
-| BLS `0x00` withdrawal credential, key | 86,913 | 514,092 | 0.8 s | 22 ms |
-| Ed25519, RFC 8032 seed | 92,403 | 513,996 | 0.7 s | 19 ms |
-| Ed25519, SLIP-0010 `m/44'/501'/0'/0'` | 871,739 | 881,588 | 3.7 s | 98 ms |
-| Ed25519, BIP32-Ed25519 `m/1852'/1815'/0'/0/0` | 1,419,418 | 923,676 | 8.0 s | 171 ms |
-| P2PKH, BIP-32 seed `m/44'/0'/0'/0/0` | 1,100,301 | 924,732 | 7.8 s | 170 ms |
-| P2PKH, BIP-32 master extended key, same path | 1,013,633 | 880,692 | 4.0 s | 115 ms |
-| P2PKH, BIP-32 seed, hidden path of at most 5 steps | 1,199,830 | 924,508 | 8.2 s | 172 ms |
-| Taproot key path, BIP-32 seed `m/86'/0'/0'/0/0` | 1,117,310 | 924,188 | 7.9 s | 160 ms |
-| Batch of 10, P2PKH, `m/44'/0'/0'/0/i` | 2,622,426 | 950,813 | 15.9 s | 336 ms |
-| Batch of 100, same | 17,885,276 | 1,080,973 | 155 s | 3.5 s |
-
-The host was shared with other jobs during this run; times are within about 20 % of an
-idle host.
-
-The seed-rooted five-step path is above 2^20 rows (the commitment pads to 2^21); rooted
-at the master extended key it is below. Of its rows, 22 SHA-512 compressions are about
-960,000 and three scalar multiplications about 96,000; `hem::curve` documents the range
-row type that would bring the multiplications to about 14,000 rows each and the
-statement under 2^20.
-
-Proving memory follows the padded row count: about 5 GB peak for the batch of 10,
-about 11 GB for 30 and 35.2 GB for 100 (one statement per process). A batch too large for the
-prover's memory is cut with `BatchStatement::chunks` into independent proofs of the
-same claims: up to 43 P2PKH entries below a seed-rooted `m/44'/0'/0'/0` pad to 2^23
-rows, so 100 addresses are three proofs of about 950 KiB at about 11 GB each.
-
-Proof length varies by a few hundred bytes with the Fiat-Shamir queries.
-
-## Registry
-
-`NullifierRegistry` records bindings (nullifier, domain, legacy identifier, target
-commitment, epoch, exposure mode) in an append-only authenticated log. It does not
-verify proofs; the command line submits a binding only after the proof verified, in the
-same process, and submits the verified statement's own binding.
-
-Guarantees, for one registry and one writer at a time:
-
-- A nullifier, once recorded, stays bound to exactly that record. A different binding
-  under it is refused (`NullifierConflict`).
-- A legacy identifier, once recorded, cannot be recorded under another nullifier, so
-  the same credential in another domain, or through another statement kind, is refused
-  (`LegacyConflict`). The identifier is per on-chain credential: the P2PKH hash, the
-  P2SH script hash, the Ethereum address, the Taproot output key, the Ed25519 key and
-  the BLS withdrawal credential of a key are different identifiers and migrate
-  independently.
-- An identical submission is accepted again and writes nothing. An enrolment reserves
-  the binding; the first durable enrolment wins.
-- An accepted submission is on disk when the call returns.
-- On open, with or without an anchor: any changed byte in a committed record or in the
-  header, reordered or substituted records, a log cut below its high-water mark, a log
-  copied to another inode and a log under another key are detected.
-
-Not detected without an anchor or a retained checkpoint: the whole log replaced by an
-earlier state of itself, and the log deleted and created anew. Both forget migrations
-and so reopen the double migration. With an anchor (`--anchor-dir` or a TPM counter in
-the command line, an `ExternalMonotoneAnchor` in the library) every append advances an
-independent monotone record of the log's length and tip, and a log behind it does not
-open. Without one, the checkpoint printed by every registry command, kept outside the
-registry's storage and passed back as `--min-checkpoint`, gives the same refusal for
-states older than that checkpoint. An anchor on the same device as the registry
-protects against restoring the registry directory, not against restoring the device.
-
-The registry is a local store. It is not a consensus system: two registries know
-nothing of each other, and a deployment with more than one verifier has to make them
-agree by its own means. The legacy chain does not consult it.
-
-In the command line the log key, the anchor key and the registry identifier derive
-from one seed in `registry.json`, optionally sealed with a passphrase. Someone who
-reads that seed can forge the log. The log key depends on whether the registry was created with an anchor, so editing the
-root file to drop the anchor requirement leaves a log that does not authenticate.
-
-## Proving from shares
-
-`hem::collab` is a threshold prover for the zk-Hem relations: a quorum of custodians
-holding MAC-authenticated additive shares of an assignment produces a proof
-(`ZkHemSplitProof`, one Stage-0 commitment per custodian) that
-`hem::collab::verify_threshold_ownership` checks with the ordinary verifier steps. Its
-module documentation states the protocol, the corruption bound (all but one member of
-the proving quorum, with abort), the argument that a deviating custodian learns only
-the abort, which parts of that argument are from the literature and which are claims of
-the module, and measured costs. `hem::collab::prep` is its dealerless preprocessing
-ceremony; the soundness arguments there are written out, not machine-checked and not
-independently reviewed.
-
-`hem::collab::prove_ownership_party` starts from a custodian's share of the legacy
-secret (`(k, n)` Shamir or XOR custody): the secret's bits enter as authenticated
-shares, `hem::collab::witgen` computes the rest of the assignment on shares, and the
-prover runs on those. The secret is not reconstructed anywhere. Witness generation
-uses statistical masking with 40 bits for range-limited openings. An elliptic-curve
-addition that can be a doubling selects chord or tangent on shares, so no abort depends
-on the key;
-its privacy argument is written in the module and is not machine-checked.
-Master seeds, hidden derivation paths and Taproot script trees are covered: the path
-and the script-tree root are known to the whole quorum and hidden from the verifier.
-Witness generation runs in as many rounds as the relation is deep (about 15,000 for a
-Bitcoin HASH160 statement), not as many as it is large. Relations with lookups into
-range tables are covered; lookups into other tables are refused.
+* **9-triple Toom-3 `Fp5` Beaver multiplication (`collab::engine::Engine::mul_ext`):**
+  Evaluates degree-4 operand polynomials locally at `{0, 1, -1, 2, -2, 3, -3, 4, inf}`,
+  batches all 9 base-field Beaver products in one round, interpolates over `F_p`, and
+  reduces modulo `u^5 - 3`.
+* **Pre-round-1 anti-rollback burn (`collab::engine::Engine::new_anchored`):**
+  Computes `tape_id = cSHAKE256("QSAG.COLLAB.TAPE.ID/v1", key_shares || lengths || triples || randoms)`
+  and advances both the process-wide burned-tape set and the hardware/external
+  `ExternalMonotoneAnchor` **before round 1** (`0` network bytes sent). The tape snapshot must retain its original expected generation across restarts.
+  A stale generation or an in-process duplicate fails before transmission and drops
+  the tape. The external checkpoint stores the latest generation and tag. Historical
+  tape IDs are retained only for the lifetime of the process.

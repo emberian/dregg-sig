@@ -133,21 +133,21 @@
 //! two fixed-base multiplications 137,000, the BLAKE2s compression of `CRH^ivk` 21,000,
 //! and a BLAKE2b compression of about 50,000 rows for each of the 2 (spending key) or 21
 //! (seed of at most 128 bytes; 22 above) blocks of the key derivation. It contains
-//! multiplication rows only. Measured on hbox (i9-12900, 22 threads), regime 4
-//! (`BciksJohnsonQrom128`), release build:
+//! multiplication rows only, proved under `Profile::TurboShakeJohnson400` (wire tag `17`,
+//! `QSAGZKH2`, Quintic `Fp5`, `[DKT26]` / `[CWYZ26]` `< 2^{-128}` QROM):
 //!
-//! ```text
-//! HEM_ZCASH statement="sapling-address SpendingKey" regime=4 rows=976284 padded_rows=2^20 vars=963499 public_inputs=766 cells=2^21 synth_s=3.23 prove_s=5.21 verify_cold_s=2.60 verify_warm_ms=140.8 proof_bytes=882773 proof_kib=862.1 peak_rss_mib=2447
-//! HEM_ZCASH statement="sapling-address Zip32Seed { seed_len: 32, coin_type: 133, account: 0 }" regime=4 rows=1921425 padded_rows=2^21 vars=1893808 public_inputs=766 cells=2^22 synth_s=10.04 prove_s=17.96 verify_cold_s=10.45 verify_warm_ms=604.8 proof_bytes=924381 proof_kib=902.7 peak_rss_mib=10127
-//! ```
+//! | Statement | Key source | Rows | Padded rows | Variables | Public inputs | Table cells |
+//! | --- | --- | ---: | ---: | ---: | ---: | ---: |
+//! | `sapling-address` | `SpendingKey` | `976,284` | `2^20` | `963,499` | `766` | `2^21` |
+//! | `sapling-address` | `Zip32Seed` (`32 B`, coin `133`, acct `0`) | `1,921,425` | `2^21` | `1,893,808` | `766` | `2^22` |
 
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
-use dregg_sig_agg::pcs::WhirSecurityRegime;
-use dregg_sig_agg::zk_hem::protocol::{self, ZkHemProof};
+use dregg_sig_agg::zk_hem::v2::params::Profile;
+use dregg_sig_agg::zk_hem::v2::protocol::{self as protocol, ZkHemV2Proof};
 use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape};
 
 use super::blake2::{blake2b_256, blake2b_512_gadget, blake2s_256_block_gadget};
@@ -164,7 +164,7 @@ use crate::hem::hash::{alloc_bits, const_bits, pack_bits};
 type F = Goldilocks;
 
 const STATEMENT_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.ZCASH.SADR/1";
-const PROOF_MAGIC: &[u8; 8] = b"QSHEMZS1";
+const PROOF_MAGIC: &[u8; 8] = b"QSHEMZS2";
 const NULLIFIER_PERSONAL: &[u8; 16] = b"QSAG_ZcashSapAdN";
 
 /// Registry tag of a Sapling payment address `d || pk_d`.
@@ -820,7 +820,7 @@ fn build(source: &SaplingKeySource, public_bits: &[bool], secret: &[u8]) -> (Sha
     pin(cs, &point_repr(&pk_u, &pk_v), &public[510..]);
 
     let rows = cs.num_rows();
-    let (shape, assignment) = core::mem::take(cs).finish();
+    let (shape, assignment) = core::mem::take(cs).finish_v2();
     (shape, assignment, rows)
 }
 
@@ -1005,9 +1005,9 @@ impl SaplingAddressStatement {
             })
     }
 
-    fn transcript(&self, regime: WhirSecurityRegime) -> Vec<u8> {
+    fn transcript(&self, regime: Profile) -> Vec<u8> {
         let mut out = self.to_bytes();
-        out.push(regime as u8);
+        out.push(regime.wire_tag());
         out
     }
 
@@ -1060,7 +1060,7 @@ pub fn synthesize_sapling_address(
 /// zk-Hem.
 pub fn sapling_address_transcript(
     statement: &SaplingAddressStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
 ) -> Vec<u8> {
     statement.transcript(regime)
 }
@@ -1069,8 +1069,8 @@ pub fn sapling_address_transcript(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaplingAddressProof {
     key_tag: u8,
-    pub regime: WhirSecurityRegime,
-    pub proof: ZkHemProof,
+    pub regime: Profile,
+    pub proof: ZkHemV2Proof,
 }
 
 impl SaplingAddressProof {
@@ -1078,7 +1078,7 @@ impl SaplingAddressProof {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = PROOF_MAGIC.to_vec();
         out.push(self.key_tag);
-        out.push(self.regime as u8);
+        out.push(self.regime.wire_tag());
         out.extend_from_slice(&self.proof.to_bytes());
         out
     }
@@ -1091,12 +1091,13 @@ impl SaplingAddressProof {
         if key_tag != statement.key_source.tag() {
             return None;
         }
-        let regime = WhirSecurityRegime::from_u8(regime)?;
+        let regime = Profile::from_wire_tag(regime)?;
         let shape = sapling_address_shape(statement)?;
-        Some(Self {
+        let proof = ZkHemV2Proof::from_bytes(rest, &shape)?;
+        (proof.profile == regime).then_some(Self {
             key_tag,
             regime,
-            proof: ZkHemProof::from_bytes(rest, &shape, regime)?,
+            proof,
         })
     }
 }
@@ -1105,7 +1106,7 @@ impl SaplingAddressProof {
 pub fn prove_sapling_address(
     statement: &SaplingAddressStatement,
     witness: &SaplingKeyWitness,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
 ) -> Result<SaplingAddressProof, RecoveryError> {
     let (shape, assignment) = synthesize_sapling_address(statement, witness)?;
@@ -1128,7 +1129,7 @@ pub fn prove_sapling_address(
 /// `true`, [`SaplingAddressStatement::binding`] is what the registry should record.
 pub fn verify_sapling_address(
     statement: &SaplingAddressStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     proof: &SaplingAddressProof,
 ) -> bool {
     if proof.regime != regime || proof.key_tag != statement.key_source.tag() {
@@ -1139,13 +1140,14 @@ pub fn verify_sapling_address(
     else {
         return false;
     };
-    protocol::verify(
-        &shape,
-        &public_inputs,
-        &statement.transcript(regime),
-        regime,
-        &proof.proof,
-    )
+    proof.proof.profile == regime
+        && protocol::verify(
+            &shape,
+            &public_inputs,
+            &statement.transcript(regime),
+            regime,
+            &proof.proof,
+        )
 }
 
 /// Row count of the relation before padding, for reports: `(rows, variables)`.
@@ -1168,7 +1170,7 @@ mod tests {
     use std::println;
     use std::string::String;
 
-    const REGIME: WhirSecurityRegime = WhirSecurityRegime::BciksJohnsonQrom128;
+    const REGIME: Profile = Profile::TurboShakeJohnson400;
     const PQ: [u8; 32] = [0x51; 32];
     const DOMAIN: [u8; 32] = [0x44; 32];
     const EPOCH: u64 = 7;
@@ -1642,7 +1644,7 @@ mod tests {
             }
             assert_ne!(
                 sapling_address_transcript(&st, REGIME),
-                sapling_address_transcript(&st, WhirSecurityRegime::Cdhz25JohnsonQrom128)
+                sapling_address_transcript(&st, Profile::CshakeJohnson400)
             );
         }
         let st = statement(&SaplingKeySource::SpendingKey, &diversifier(3));
@@ -1971,7 +1973,7 @@ mod tests {
         // Another regime, tampered proof bytes, truncation and extension.
         assert!(!verify_sapling_address(
             &st,
-            WhirSecurityRegime::Cdhz25JohnsonQrom128,
+            Profile::CshakeJohnson400,
             &proof
         ));
         for at in [0, 7, 8, 9, 10, 80, bytes.len() / 2, bytes.len() - 1] {
@@ -2075,7 +2077,7 @@ mod tests {
         };
         assert!(note_st.is_well_formed());
         assert!(RecoveryProof::from_bytes(&bytes, &note_st).is_none());
-        let mut note_framed = b"QSHEMZN1".to_vec();
+        let mut note_framed = b"QSHEMZN2".to_vec();
         note_framed.extend_from_slice(&bytes[8..10]);
         note_framed.extend_from_slice(&[0x42; 64]);
         note_framed.extend_from_slice(&bytes[10..]);
@@ -2106,13 +2108,13 @@ mod tests {
                       verify_cold_s: f64,
                       verify_warm_ms: f64,
                       proof_bytes: usize| {
-            let layout = protocol::Layout::new(shape, REGIME).unwrap();
+            let layout = protocol::layout_of(shape).unwrap();
             println!(
                 "HEM_ZCASH statement=\"{name}\" regime={} rows={rows} padded_rows=2^{} vars={} \
                  public_inputs={} cells=2^{} synth_s={synth_s:.2} prove_s={prove_s:.2} \
                  verify_cold_s={verify_cold_s:.2} verify_warm_ms={verify_warm_ms:.1} \
                  proof_bytes={proof_bytes} proof_kib={:.1} peak_rss_mib={}",
-                REGIME as u8,
+                REGIME.wire_tag(),
                 shape.log_rows,
                 shape.num_vars,
                 shape.num_public,

@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn dealerless_baggy_waistband_root_certificate() {
-        const CHILD: &str = "DREGG_SIG_VOLATILE_WAISTBAND_CHILD";
+        const CHILD: &str = "QSAG_VOLATILE_WAISTBAND_CHILD";
         if std::env::var_os(CHILD).is_none() {
             // Measured child peak: 7.9 GB of locked memory.
             let _memory = crate::test_budget::reserve_mb(8_200);
@@ -446,7 +446,7 @@ mod tests {
 
     fn check_mint(t: usize, n: usize, count: usize, name: &str, child_peak_mb: usize) {
         // Process-wide protection must not affect the test harness's other tests.
-        const CHILD: &str = "DREGG_SIG_VOLATILE_MINT_MATRIX_CHILD";
+        const CHILD: &str = "QSAG_VOLATILE_MINT_MATRIX_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let _memory = crate::test_budget::reserve_mb(child_peak_mb);
             let name = format!("volatile_coupon::mint::tests::{name}");
@@ -482,7 +482,7 @@ mod tests {
                     parent,
                     parties: n,
                     members: members.clone(),
-                    expires_at: now().unwrap() + 600,
+                    expires_at: now().unwrap() + 3600,
                     coupons: count,
                 },
             )

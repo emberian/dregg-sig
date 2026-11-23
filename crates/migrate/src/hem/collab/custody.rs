@@ -20,6 +20,8 @@ use alloc::vec::Vec;
 use dregg_sig_agg::field::Goldilocks;
 use dregg_sig_core::field::tower::{TowerGf256, lagrange_weights_zero_gf256};
 
+use dregg_sig_core::wipe::{SecretBuffer, SecretScratch};
+
 use super::engine::{Engine, MpcError, Sb};
 use super::net::Transport;
 
@@ -59,7 +61,11 @@ pub fn xor_share_from_shamir(quorum: &[usize], party: usize, share: &[u8]) -> Op
 
 /// Triples and uniform values one custodian consumes in [`input_secret_bits`].
 pub const fn input_demand(parties: usize, bytes: usize) -> (usize, usize) {
-    (8 * bytes * (2 * parties - 1), 8 * bytes * parties)
+    let bits = 8usize.saturating_mul(bytes);
+    (
+        bits.saturating_mul(2usize.saturating_mul(parties).saturating_sub(1)),
+        bits.saturating_mul(parties),
+    )
 }
 
 /// Authenticated shares of the bits of the secret whose XOR shares the custodians hold,
@@ -70,20 +76,20 @@ pub fn input_secret_bits<T: Transport>(
 ) -> Result<Vec<Sb>, InputError> {
     let (me, parties) = (e.me(), e.parties());
     let count = 8 * xor_share.len();
-    let mut mine: Vec<F> = (0..count)
+    let mine: SecretScratch<F> = (0..count)
         .map(|i| F::from_u64_reduced(u64::from((xor_share[i / 8] >> (i % 8)) & 1)))
         .collect();
-    let mut inputs = Vec::with_capacity(parties);
+    let mut inputs = SecretBuffer(Vec::with_capacity(parties));
     for owner in 0..parties {
         inputs.push(e.input(owner, (owner == me).then_some(&mine[..]), count)?);
     }
-    dregg_sig_asm::volatile_fill(&mut mine, F::ZERO);
+    drop(mine);
 
     // Every input is a bit: `b (b - 1) = 0`, opened after the MAC check.
-    let flat: Vec<Sb> = inputs.iter().flatten().copied().collect();
+    let flat: SecretScratch<Sb> = inputs.iter().flatten().copied().collect();
     let minus_one = e.public(F::ZERO - F::ONE);
-    let shifted: Vec<Sb> = flat.iter().map(|&b| b + minus_one).collect();
-    let products = e.mul(&flat, &shifted)?;
+    let shifted: SecretScratch<Sb> = flat.iter().map(|&b| b + minus_one).collect();
+    let products = SecretScratch::from(e.mul(&flat, &shifted)?);
     e.check()?;
     let opened = e.open(&products)?;
     e.check()?;
@@ -91,14 +97,14 @@ pub fn input_secret_bits<T: Transport>(
         return Err(InputError::NotBits);
     }
 
-    let mut acc = inputs[0].clone();
+    let mut acc = SecretBuffer(core::mem::take(&mut inputs[0]));
     for next in &inputs[1..] {
-        let both = e.mul(&acc, next)?;
+        let both = SecretScratch::from(e.mul(&acc, next)?);
         for ((a, &b), &ab) in acc.iter_mut().zip(next).zip(&both) {
             *a = *a + b - ab.scale(F::TWO);
         }
     }
-    Ok(acc)
+    Ok(acc.into_inner())
 }
 
 #[cfg(test)]
@@ -206,5 +212,13 @@ pub(super) mod tests {
         });
         assert_eq!(out[0], Err(InputError::NotBits));
         assert_eq!(out[1], Err(InputError::NotBits));
+    }
+
+    #[test]
+    fn tooth_input_demand_zero_parties_does_not_underflow() {
+        // `#tooth`: `input_demand(0, 32)` previously panicked with `2 * 0 - 1` underflow.
+        assert_eq!(input_demand(0, 32), (0, 0));
+        assert_eq!(input_demand(1, 4), (32, 32));
+        assert_eq!(input_demand(3, 4), (160, 96));
     }
 }

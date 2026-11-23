@@ -1,7 +1,7 @@
 //! NIST FIPS 202 `Keccak-f[1600]` & `SHAKE256`, NIST SP 800-185 `cSHAKE256`, self-delimiting
 //! LEB128 `encode_multi_frame`, and compile-time typestate `FiatShamirTranscript<Phase>`.
 //!
-//! Matches `lean/Qsag/Keccak.lean` bit-for-bit across all rate boundaries, customization prefixes,
+//! Matches `lean/Qsag/Oracle/Keccak.lean` bit-for-bit across all rate boundaries, customization prefixes,
 //! and official FIPS 202 conformance vectors.
 
 use alloc::vec;
@@ -174,7 +174,8 @@ fn cached_customization_midstate(tag: &[u8]) -> Option<[u64; 25]> {
         b"QSAG.OT.COMBINER.COIN.COM/v1",
         b"QSAG.OT.COMBINER.EXT/v1",
         b"QSAG.OT.EXT.COL/v2",
-        b"QSAG.OT.EXT.UCOLS/v3",
+        b"QSAG.OT.KOS.UCOLS/v2",
+        b"QSAG.OT.KOS.ICHAL/v2",
         b"QSAG.PUBLIC.COIN.COM/v1",
         b"QSAG.PUBLIC.COIN.OUT/v1",
         b"QSAG.PUBLIC.PERM/v1",
@@ -215,7 +216,7 @@ fn cached_customization_midstate(tag: &[u8]) -> Option<[u64; 25]> {
         b"QSAG.OT.CRS.COMMIT/v1",
         b"QSAG.OT.COMBINER.COMMIT/v1",
         b"QSAG.OT.PARCOMB.RNG/v1",
-        b"QSAG.OT.EXT.BIND/v3",
+        b"QSAG.OT.KOS.BIND/v2",
         b"QSAG.COIN.COMMIT/v1",
         b"QSAG.BASE_OT.PROOF/v2",
         b"QSAG.OT.MESH.SENDER/v1",

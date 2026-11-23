@@ -24,6 +24,7 @@ dependencies = [
  "dregg-sig-accel",
  "dregg-sig-asm",
  "dregg-sig-core",
+ "dregg-sig-cred",
  "dregg-sig-fts",
  "dregg-sig-quorum",
  "dregg-sig-whir-verified",
@@ -32,6 +33,16 @@ dependencies = [
 [[package]]
 name = "dregg-sig-asm"
 version = "0.1.0"
+
+[[package]]
+name = "dregg-sig-ass2"
+version = "0.1.0"
+dependencies = [
+ "dregg-sig-accel",
+ "dregg-sig-agg",
+ "dregg-sig-core",
+ "dregg-sig-fts",
+]
 
 [[package]]
 name = "dregg-sig-cli"

@@ -7,8 +7,8 @@
 //! when an operand is the identity or the operands are equal or opposite. The result is
 //! checked against the `orchard_sinsemilla` test vectors.
 //!
-//! The chunk value indexes the table of `S` points, as in the reference implementation;
-//! the lookup is not constant time.
+//! Each chunk selects its affine coordinates by scanning the full table. The incomplete
+//! addition checks accumulate one validity bit across the whole message.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -43,12 +43,6 @@ pub fn s_table() -> Arc<Vec<(Fp, Fp)>> {
     Arc::new(build_table())
 }
 
-/// `P ⸭ Q` for non-identity operands: `None` when `P = Q` or `P = -Q`.
-fn incomplete_add(p: &Point, q: &Point) -> Option<Point> {
-    let ((px, _), (qx, _)) = (p.to_affine()?, q.to_affine()?);
-    (px != qx).then(|| p.add(q))
-}
-
 /// A Sinsemilla hash domain.
 #[derive(Clone, Debug)]
 pub struct HashDomain {
@@ -72,17 +66,26 @@ impl HashDomain {
         assert!(bits.len() <= K * C, "Sinsemilla message too long");
         let table = s_table();
         let mut acc = self.q;
+        let mut valid = true;
         for chunk in bits.chunks(K) {
             let index = chunk
                 .iter()
                 .enumerate()
                 .fold(0usize, |v, (i, &b)| v | ((b as usize) << i));
-            let (sx, sy) = table[index];
+            let mut sx = Fp::ZERO;
+            let mut sy = Fp::ZERO;
+            for (i, &(x, y)) in table.iter().enumerate() {
+                let take = dregg_sig_accel::ct::ct_eq_u64(i as u64, index as u64);
+                sx = Fp::select(take, x, sx);
+                sy = Fp::select(take, y, sy);
+            }
             let s = Point::from_affine(sx, sy).expect("table point is on the curve");
-            let t = incomplete_add(&acc, &s)?;
-            acc = incomplete_add(&t, &acc)?;
+            valid &= acc.incomplete_add_defined(&s);
+            let t = acc.add(&s);
+            valid &= t.incomplete_add_defined(&acc);
+            acc = t.add(&acc);
         }
-        Some(acc)
+        valid.then_some(acc)
     }
 
     /// `SinsemillaHash`: the `x` coordinate of [`Self::hash_to_point`].

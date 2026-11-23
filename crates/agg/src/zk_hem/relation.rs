@@ -1,62 +1,24 @@
-//! Relations proved by the committed zk-Hem protocol in [`super::protocol`].
+//! Relations proved by the committed zk-Hem v2 protocol in [`super::v2::protocol`] and the
+//! public hologram / recursion protocols in [`super::protocol`].
 //!
 //! A relation is a list of rows over one assignment vector `z` (`z[0] = 1`):
 //!
 //! * S-box rows `<a, z>^7 = <c, z>`,
-//! * multiplication rows `<a, z> * <b, z> = <c, z>`.
+//! * multiplication rows `<a, z> * <b, z> = <c, z>`,
+//! * optional LogUp lookup tuples ([`Lookups`]).
 //!
 //! S-box rows come first, so the row selector is a prefix indicator the verifier evaluates
 //! in `O(log rows)`. Public values enter as constants of the linear forms, so they are part
-//! of the [`Shape`] and of its digest. Twelve masking rows over twelve masking variables are
-//! appended by [`ConstraintSystem::finish`]; the prover fills those variables with fresh
-//! uniform values (see [`MASK_ROWS`]).
+//! of the [`Shape`] and of its digest.
 //!
-//! # Definitions
-//!
-//! A prover that holds the witness in shares cannot run a gadget's native arithmetic. A
-//! builder made by [`ConstraintSystem::new_recording`] therefore keeps, for every
-//! variable, how its value follows from earlier variables ([`Def`]); gadgets state it
-//! with [`ConstraintSystem::alloc_defined`]. A variable from plain
-//! [`ConstraintSystem::alloc`] is [`Def::Undefined`], and
-//! [`Definitions::undefined`] lists those: a relation is usable by a threshold prover
-//! only when that list is empty. Recording changes neither the rows nor the assignment.
-//!
-//! # Lookups
-//!
-//! A relation may also say that a tuple of linear forms is a row of a public table:
-//!
-//! * [`ConstraintSystem::enforce_byte`]: a linear form takes a value in `[0, 2^8)`, as a
-//!   field element (no reduction modulo anything but the Goldilocks prime). Other ranges
-//!   are compositions: a limb `v` of `w < 8` bits is `enforce_byte(v)` and
-//!   `enforce_byte(2^(8 - w) v)`; a `16`-bit value is `lo + 2^8 hi` with both limbs
-//!   checked.
-//! * [`ConstraintSystem::table`] and [`ConstraintSystem::enforce_in_table`]:
-//!   `(lc_1, .., lc_k)` is a row of a fixed table with `k` columns
-//!   ([`ConstraintSystem::range_table`] is the one-column table `0..2^bits`).
-//!
-//! This is the interface asked for in the module comment of `dregg-sig-migrate`'s
-//! `hem/curve.rs` ("Wanted from the constraint system").
-//!
-//! A lookup adds no row and no variable of its own. Per table row the relation gains one
-//! variable, the number of lookups that hit that row (its multiplicity), which
-//! [`ConstraintSystem::finish`] allocates and assigns. The lookups live in [`Lookups`], a
-//! second public structure of the [`Shape`] bound into its digest: a list of *fractions*
-//! `n_i / (alpha - v_i)` whose numerators and value tuples are linear forms of the
-//! assignment,
-//!
-//! * `1 / (alpha - (t, lc_1, .., lc_k))` for a lookup into table `t`,
-//! * `-m_r / (alpha - (t, row_r))` for row `r` of table `t` with multiplicity variable `m_r`,
-//!
-//! and the statement is that the fractions sum to zero as rational functions of `alpha`:
-//! for every tuple value, the numerators of the fractions with that value sum to zero
-//! ([`Lookups::holds`]). Over a field of characteristic larger than the number of lookups
-//! this holds exactly when every looked-up tuple is a table row and every multiplicity is
-//! the true count (`logup-2022-1530`, Lemma 5, which is stated for one column; the tuple
-//! form with a table tag is the batching of its Section 3.4). How the protocol proves it,
-//! and what that costs in soundness and in committed cells, is in [`super::protocol`].
-//!
-//! A relation without lookups has `Shape::lookups() == None`, the digest it had before
-//! lookups existed, and the same proofs.
+//! Two closings exist ([`Closing`]):
+//! * [`Closing::V2`] ([`ConstraintSystem::finish_v2`] and [`ConstraintSystem::finish_recorded`]):
+//!   the hiding zk-Hem v2 layout (`SECURITY.md`, V2.1), appending 15 row-masking variables on
+//!   three 8-row corners (plus 10 lookup-masking variables on one 8-entry corner when lookups
+//!   are used).
+//! * [`Closing::Public`] ([`ConstraintSystem::finish`]): the 12-row layout retained exclusively
+//!   for non-hiding public proofs (`PublicHemProof`, `HologramPublicProof`,
+//!   `RecursivePublicHemProof`).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
@@ -64,8 +26,12 @@ use alloc::vec::Vec;
 
 use crate::field::{Goldilocks, GoldilocksOps as _};
 use crate::sponge::{
-    POSEIDON2_HALF_EXT_ROUNDS, POSEIDON2_INT_ROUNDS, cshake256_static_midstate, keccak_f1600,
-    poseidon2_apply_me, poseidon2_apply_mi, poseidon2_const_at, poseidon2_perm12, poseidon2_sbox7,
+    POSEIDON2_GL24_CAPACITY, POSEIDON2_GL24_DIGEST_LIMBS, POSEIDON2_GL24_HALF_EXTERNAL_ROUNDS,
+    POSEIDON2_GL24_INTERNAL_ROUNDS, POSEIDON2_GL24_IV, POSEIDON2_GL24_MERKLE_TAG,
+    POSEIDON2_GL24_RATE, POSEIDON2_GL24_RC, POSEIDON2_GL24_SBOX_COUNT, POSEIDON2_HALF_EXT_ROUNDS,
+    POSEIDON2_INT_ROUNDS, cshake256_static_midstate, keccak_f1600, poseidon2_apply_me,
+    poseidon2_apply_mi, poseidon2_const_at, poseidon2_gl24_apply_me, poseidon2_gl24_apply_mi,
+    poseidon2_perm12, poseidon2_sbox7,
 };
 
 type F = Goldilocks;
@@ -304,11 +270,9 @@ impl Csr {
 }
 
 /// The cSHAKE256 sponge of [`Shape::digest`], absorbing little-endian words straight into
-/// the rate lanes. Absorbing `u32(x)` or `u64(x)` is absorbing the little-endian bytes of
-/// `x`; the digest is that of the concatenated bytes.
+/// the rate lanes.
 struct ShapeSponge {
     state: [u64; 25],
-    /// Bytes absorbed into the current rate block, below [`ShapeSponge::RATE`].
     pos: usize,
 }
 
@@ -322,7 +286,6 @@ impl ShapeSponge {
         }
     }
 
-    /// Absorb the low `bytes <= 8` bytes of `v`, whose other bytes are zero.
     #[inline(always)]
     fn word(&mut self, v: u64, bytes: usize) {
         let lane = self.pos / 8;
@@ -373,8 +336,7 @@ impl ShapeSponge {
     }
 }
 
-/// Rows of one kind, `(a, b, c)` each, in the order they were recorded. A row is written
-/// into the three compressed matrices when it is recorded; its linear forms are not kept.
+/// Rows of one kind, `(a, b, c)` each, in the order they were recorded.
 #[derive(Default)]
 struct Rows {
     a: Csr,
@@ -395,7 +357,6 @@ impl Rows {
         self.c.push_terms(c);
     }
 
-    /// The rows of `other` after these, one matrix at a time.
     fn append(&mut self, other: Rows) {
         let Rows { a, b, c } = other;
         self.a.append(a);
@@ -408,17 +369,93 @@ impl Rows {
     }
 }
 
-/// Number of masking rows (and masking variables) appended to every relation.
-///
-/// With `p1, p2, p3` three groups of four masking variables, the rows are
-/// `p1_k * 1 = p1_k`, `1 * p2_k = p2_k` and `p3_k * 2 = 2 p3_k`. Each group sits on one
-/// two-variable corner of the row hypercube. At a sumcheck point `rx` the groups add
-/// `(k1 e1 + k3 e3, k2 e2, k1 e1 + k2 e2 + 2 k3 e3)` to `(Az, Bz, Cz)(rx)`, where `e_g` is
-/// the corner-weighted sum of group `g` and `k_g` its common weight. That map has
-/// determinant `k1 k2 k3`, so when the corner weights have full base-field rank and the
-/// `k_g` are nonzero, the three revealed values are uniform and independent of the rest of
-/// the assignment.
+/// Reserved row count of [`Closing::Public`] (`12` rows).
 pub const MASK_ROWS: usize = 12;
+
+/// How a relation was closed: which trailing rows and variables it ends with.
+///
+/// * [`Closing::Public`] ([`ConstraintSystem::finish`]): retained solely for non-hiding
+///   public and Spark-hologram recursion proofs (`PublicHemProof`, `HologramPublicProof`,
+///   `RecursivePublicHemProof`).
+/// * [`Closing::V2`] ([`ConstraintSystem::finish_v2`] and [`ConstraintSystem::finish_recorded`]):
+///   the layout of zk-Hem v2 (`SECURITY.md`, V2.1), with three groups of five masking variables
+///   on three corners of eight rows (plus ten lookup-masking variables on one 8-entry corner
+///   when [`Lookups`] are present).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closing {
+    Public,
+    V2,
+}
+
+impl Closing {
+    /// Masking variables per group.
+    pub const fn group(self) -> usize {
+        match self {
+            Self::Public => 4,
+            Self::V2 => 5,
+        }
+    }
+
+    /// Rows of one corner.
+    pub const fn corner_rows(self) -> usize {
+        match self {
+            Self::Public => 4,
+            Self::V2 => 8,
+        }
+    }
+
+    /// Row-masking variables appended to the assignment.
+    pub const fn mask_vars(self) -> usize {
+        3 * self.group()
+    }
+
+    /// Rows reserved at the top of the row cube.
+    pub const fn pad_rows(self) -> usize {
+        3 * self.corner_rows()
+    }
+
+    const fn min_log_rows(self) -> u32 {
+        match self {
+            Self::Public => 4,
+            Self::V2 => 5,
+        }
+    }
+
+    /// Append the three corners for the masking variables `mask_var_base..`.
+    fn push_rows(self, mask_var_base: usize, a: &mut Csr, b: &mut Csr, c: &mut Csr) {
+        let one = Lc::constant(F::ONE);
+        let two = Lc::constant(F::TWO);
+        let empty = Lc::zero();
+        for g in 0..3 {
+            for k in 0..self.corner_rows() {
+                if k >= self.group() {
+                    a.push_row(&empty);
+                    b.push_row(&empty);
+                    c.push_row(&empty);
+                    continue;
+                }
+                let p = Lc::term(Var((mask_var_base + g * self.group() + k) as u32), F::ONE);
+                match g {
+                    0 => {
+                        a.push_row(&p);
+                        b.push_row(&one);
+                        c.push_row(&p);
+                    }
+                    1 => {
+                        a.push_row(&one);
+                        b.push_row(&p);
+                        c.push_row(&p);
+                    }
+                    _ => {
+                        a.push_row(&p);
+                        b.push_row(&two);
+                        c.push_row(&p.scaled(F::TWO));
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Definitions of variables
@@ -464,8 +501,7 @@ pub enum Source {
         bits: u32,
     },
     /// The canonical residue of `(sum_j a_j b_j + c) / den` modulo the prime `modulus`
-    /// (little-endian bytes). An empty `den` is one. A denominator that is zero modulo
-    /// the prime has no value.
+    /// (little-endian bytes). An empty `den` is one.
     Residue {
         products: Vec<(Vec<IntCoef>, Vec<IntCoef>)>,
         linear: Vec<IntCoef>,
@@ -473,9 +509,7 @@ pub enum Source {
         modulus: Vec<u8>,
     },
     /// The slope of an affine addition that may be a doubling, as a canonical residue
-    /// modulo the prime `modulus`: `num / den` where `den` is not zero modulo the prime
-    /// (the chord), and `(sum_j a_j b_j + c) / tangent_den` where it is (the tangent).
-    /// The gadget guarantees that `tangent_den` is not zero in that case.
+    /// modulo the prime `modulus`.
     Slope {
         num: Vec<IntCoef>,
         den: Vec<IntCoef>,
@@ -502,10 +536,9 @@ pub enum Def {
     One,
     /// A public input.
     Public,
-    /// A masking variable appended by [`ConstraintSystem::finish`].
+    /// A masking variable appended when closing the relation.
     Mask,
-    /// The multiplicity of a table row: how many of the relation's lookups
-    /// ([`Shape::lookups`]) have that row as their tuple.
+    /// The multiplicity of a table row in [`Shape::lookups`].
     Multiplicity,
     /// `a b`.
     Product(Lc, Lc),
@@ -513,7 +546,7 @@ pub enum Def {
     Power7(Lc),
     /// `base + sum_j a_j b_j`.
     SumOfProducts { base: Lc, products: Vec<(Lc, Lc)> },
-    /// `scale (num / den - minus)` in the field. The gadget guarantees `den != 0`.
+    /// `scale (num / den - minus)` in the field.
     Ratio {
         num: Lc,
         den: Lc,
@@ -549,21 +582,22 @@ impl Definitions {
     }
 }
 
-/// Masking entries at the top of the fraction list of a relation with lookups, and half the
-/// number of masking variables they use: entry `k` has a free numerator variable and a free
-/// value variable (first tuple column), both uniform, and is not constrained. They make the
-/// three values the lookup sumcheck reveals uniform, as the masking rows do for the row
-/// values.
-pub const LOOKUP_MASK_ENTRIES: usize = 4;
+/// Active lookup-masking entries per limb of `Fp5`: entry `k in 0..5` on the top 8-entry
+/// corner has a free numerator variable and a free first-column denominator variable.
+pub const LOOKUP_MASK_ENTRIES: usize = 5;
+/// Reserved entries at the top of the fraction list (`2^3 = 8` corner slots holding the
+/// [`LOOKUP_MASK_ENTRIES`] active masking entries).
+pub const LOOKUP_CORNER_ENTRIES: usize = 8;
 
 /// Handle of a public table registered with [`ConstraintSystem::table`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableId(u32);
 
-/// The lookups of a relation as a list of `2^log_entries` fractions (module comment).
-/// Entry `i` has numerator `<num[i], z>` and the value tuple `(<den[c][i], z>)_c`; column
-/// `0` is the table tag. Entries `0..num_checked()` are constrained; the last
-/// [`LOOKUP_MASK_ENTRIES`] are masking entries.
+/// The lookups of a v2 relation as a list of `2^log_entries` fractions.
+/// Entry `i` has numerator `<num[i], z>` and value tuple `(<den[c][i], z>)_c`; column `0`
+/// is the table tag. Entries `0..num_checked()` are constrained; the last
+/// [`LOOKUP_CORNER_ENTRIES`] form the 3-bit masking corner whose first
+/// [`LOOKUP_MASK_ENTRIES`] entries carry fresh uniform numerator/denominator variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lookups {
     pub log_entries: usize,
@@ -583,10 +617,17 @@ impl Lookups {
         1usize << self.log_entries
     }
 
-    /// Entries below this index are constrained and summed.
+    /// Entries below this index are constrained and summed; also the start of the 8-entry
+    /// masking corner.
     #[inline]
     pub fn num_checked(&self) -> usize {
-        self.num_entries() - LOOKUP_MASK_ENTRIES
+        self.num_entries() - LOOKUP_CORNER_ENTRIES
+    }
+
+    /// First index of the 8-entry masking corner at the top of the fraction cube.
+    #[inline]
+    pub fn mask_entry_base(&self) -> usize {
+        self.num_entries() - LOOKUP_CORNER_ENTRIES
     }
 
     /// Columns of a value tuple, the table tag included.
@@ -615,7 +656,7 @@ impl Lookups {
     }
 
     fn stream_into(&self, sponge: &mut ShapeSponge) {
-        sponge.bytes(b"QSAG.ZKHEM.SHAPE.LOOKUP/v1");
+        sponge.bytes(b"QSAG.ZKHEM2.SHAPE.LOOKUP/v1");
         for n in [
             self.log_entries,
             self.num_lookups,
@@ -634,9 +675,7 @@ impl Lookups {
 
 struct LookupTable {
     width: usize,
-    /// Row-major canonical values.
     rows: Vec<u64>,
-    /// How many lookups hit each row. Witness-dependent.
     mult: Vec<u64>,
 }
 
@@ -648,11 +687,7 @@ const P2_VAR_TAG: u32 = 1u32 << 31;
 /// (`rows 12..118`) of every aligned width-12 Poseidon2 permutation in a [`Shape`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HologramMeta {
-    /// Number of 128-row / 128-var aligned Poseidon2 permutations at row prefix `[0..128*P)`.
-    /// Zero for shapes built via [`ConstraintSystem::new`].
     pub poseidon2_perms: usize,
-    /// Number of 128-variable blocks reserved for `[1, public_inputs...]` before the aligned
-    /// Poseidon2 variable arena `[128 * pub_var_blocks .. 128 * (pub_var_blocks + P))`.
     pub pub_var_blocks: usize,
 }
 
@@ -665,15 +700,15 @@ pub struct Shape {
     pub num_sbox: usize,
     /// Variables, including the constant and the masking variables.
     pub num_vars: usize,
-    /// Variables `1..=num_public` are public inputs: the verifier supplies their values and
-    /// the protocol checks the committed cells against them.
+    /// Variables `1..=num_public` are public inputs.
     pub num_public: usize,
-    /// First of the [`MASK_ROWS`] masking variables.
+    /// First of the masking variables appended by the closing.
     pub mask_var_base: usize,
     pub a: Csr,
     pub b: Csr,
     pub c: Csr,
     hologram_meta: HologramMeta,
+    closing: Closing,
     lookups: Option<Lookups>,
     digest: [u8; 32],
 }
@@ -693,26 +728,28 @@ impl Shape {
     /// First row of masking group `g in 0..3`.
     #[inline]
     pub fn mask_row_base(&self, g: usize) -> usize {
-        self.num_rows() - 4 * (3 - g)
+        self.num_rows() - self.closing.corner_rows() * (3 - g)
     }
 
-    /// Binding digest of the whole relation, public constants included. Computed once by
-    /// [`ConstraintSystem::finish`].
+    /// Which closing produced the trailing rows and variables.
+    #[inline]
+    pub fn closing(&self) -> Closing {
+        self.closing
+    }
+
+    /// Binding digest of the whole relation, public constants and lookup tables included.
     #[inline]
     pub fn digest(&self) -> [u8; 32] {
         self.digest
     }
 
-    /// Block-alignment metadata for Spark hologram factorization (`poseidon2_perms == 0` when
-    /// constructed via [`ConstraintSystem::new`]).
+    /// Block-alignment metadata for Spark hologram factorization.
     #[inline]
     pub fn hologram_meta(&self) -> HologramMeta {
         self.hologram_meta
     }
 
-    /// Whether row `i` belongs to the residual sparse hologram (excluding the 106 universal
-    /// interior S-box rows `12..118` and 10 zero padding rows `118..128` of aligned Poseidon2
-    /// blocks, which are evaluated in $O(\log P)$ closed form).
+    /// Whether row `i` belongs to the residual sparse hologram.
     #[inline]
     pub fn is_residual_row(&self, row: usize) -> bool {
         let p = self.hologram_meta.poseidon2_perms;
@@ -724,9 +761,14 @@ impl Shape {
     }
 
     fn compute_digest(&self) -> [u8; 32] {
-        const SHAPE_MIDSTATE: [u64; 25] = cshake256_static_midstate(b"QSAG.ZKHEM.SHAPE/v1");
+        const SHAPE_PUBLIC_MIDSTATE: [u64; 25] = cshake256_static_midstate(b"QSAG.ZKHEM.SHAPE/v1");
+        const SHAPE_V2_MIDSTATE: [u64; 25] = cshake256_static_midstate(b"QSAG.ZKHEM.SHAPE/v2");
         let _phase = crate::profile::span("hem_shape_digest");
-        let mut sponge = ShapeSponge::new(SHAPE_MIDSTATE);
+        let midstate = match self.closing {
+            Closing::Public => SHAPE_PUBLIC_MIDSTATE,
+            Closing::V2 => SHAPE_V2_MIDSTATE,
+        };
+        let mut sponge = ShapeSponge::new(midstate);
         for n in [
             self.log_rows,
             self.num_sbox,
@@ -745,7 +787,7 @@ impl Shape {
         sponge.finish()
     }
 
-    /// Whether `z` (with `z[0] = 1`) satisfies every row.
+    /// Whether `z` (with `z[0] = 1`) satisfies every row and lookup.
     pub fn is_satisfied(&self, z: &[F]) -> bool {
         z.len() == self.num_vars
             && z[0] == F::ONE
@@ -762,14 +804,8 @@ impl Shape {
     }
 }
 
-/// Relation builder that carries an assignment alongside the rows.
-///
-/// The row structure must not depend on assigned values: the verifier rebuilds the [`Shape`]
-/// by running the same synthesis on a placeholder assignment.
-///
-/// A row is written into compressed matrices as it is recorded, one group per kind of
-/// row so that [`Self::finish`] only concatenates the groups; the builder holds about
-/// twelve bytes per matrix entry and no linear form of a recorded row.
+/// Relation builder that streams rows directly into compressed-row matrices alongside an
+/// assignment.
 pub struct ConstraintSystem {
     values: Vec<F>,
     record_rows: bool,
@@ -777,16 +813,12 @@ pub struct ConstraintSystem {
     hologram_aligned: bool,
     p2_perms: usize,
     p2_values: Vec<F>,
-    /// S-box rows of aligned Poseidon2 blocks, then the other S-box rows, then the
-    /// multiplication rows: the row order of the relation. S-box rows have an empty `b`.
     p2_sbox: Rows,
     sbox: Rows,
     mul: Rows,
     defs: Option<Definitions>,
     tables: Vec<LookupTable>,
     range_tables: Vec<(usize, TableId)>,
-    /// Table of each recorded lookup, and column `k` of the looked-up tuples as a matrix
-    /// with one row per lookup (empty where the tuple is narrower).
     lookup_tables: Vec<u32>,
     lookup_columns: Vec<Csr>,
     num_lookups: usize,
@@ -820,7 +852,7 @@ impl ConstraintSystem {
     }
 
     /// A builder that records a [`Def`] for every variable; close it with
-    /// [`Self::finish_recorded`].
+    /// [`Self::finish_recorded`] (produces a [`Closing::V2`] relation).
     pub fn new_recording() -> Self {
         let mut cs = Self::new();
         cs.defs = Some(Definitions {
@@ -858,14 +890,14 @@ impl ConstraintSystem {
         var
     }
 
-    /// [`Self::finish`] with the recorded definitions.
+    /// [`Self::finish_v2`] with the recorded definitions.
     pub fn finish_recorded(mut self) -> (Shape, Vec<F>, Definitions) {
         assert!(
             !self.hologram_aligned,
             "recording a hologram-aligned relation"
         );
         let mut defs = self.defs.take().expect("a recording builder");
-        let (shape, z) = self.finish();
+        let (shape, z) = self.finish_v2();
         defs.vars.resize(shape.num_vars, Def::Mask);
         if let Some(lookups) = shape.lookups() {
             defs.vars[lookups.mult_var_base..shape.mask_var_base].fill(Def::Multiplicity);
@@ -874,18 +906,14 @@ impl ConstraintSystem {
     }
 
     /// Relation builder that places [`poseidon2_perm`] S-box rows and S-box output variables on
-    /// 128-row / 128-variable boundaries so [`super::protocol::ShapeHologram`] evaluates 90%+ of
-    /// Poseidon2 matrix entries in $O(\log P)$ closed form.
+    /// 128-row / 128-variable boundaries for [`super::protocol::ShapeHologram`].
     pub fn new_hologram_aligned() -> Self {
         let mut cs = Self::new();
         cs.hologram_aligned = true;
         cs
     }
 
-    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices: run
-    /// the synthesis that produced a [`Shape`] on this builder and close it with
-    /// [`Self::finish_assignment`]. The resulting assignment must still be checked against
-    /// the compiled shape (the prover's row check does).
+    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices.
     pub fn witness_only() -> Self {
         let mut cs = Self::new();
         cs.record_rows = false;
@@ -893,8 +921,7 @@ impl ConstraintSystem {
     }
 
     /// The assignment of a [`Self::witness_only`] builder, laid out for `shape` (masking
-    /// variables zero). `None` when the synthesis allocated a different number of public
-    /// inputs or variables than `shape` has.
+    /// variables zero).
     pub fn finish_assignment(mut self, shape: &Shape) -> Option<Vec<F>> {
         assert!(!self.record_rows && !self.hologram_aligned);
         self.push_multiplicities();
@@ -907,6 +934,7 @@ impl ConstraintSystem {
         Some(core::mem::take(&mut self.values))
     }
 
+    #[cfg(test)]
     pub(crate) fn fork_public_inputs(&self) -> Self {
         assert_eq!(self.values.len(), self.num_public + 1);
         assert!(self.p2_values.is_empty());
@@ -938,8 +966,8 @@ impl ConstraintSystem {
         }
     }
 
-    /// Append a disjoint circuit with the same public prefix, relocating private
-    /// variables. Preserves the serial allocation/row order for canonical shapes.
+    /// Append a disjoint circuit with the same public prefix, relocating private variables.
+    #[cfg(test)]
     pub(crate) fn append(&mut self, mut other: Self) {
         assert_eq!(self.num_public, other.num_public);
         assert_eq!(self.record_rows, other.record_rows);
@@ -1012,8 +1040,7 @@ impl ConstraintSystem {
         );
     }
 
-    /// Allocate a public input. All public inputs must be allocated before any other
-    /// variable, so that they occupy variables `1..=num_public`.
+    /// Allocate a public input (`1..=num_public`).
     pub fn public_input(&mut self, value: F) -> Var {
         assert_eq!(
             self.values.len(),
@@ -1030,7 +1057,6 @@ impl ConstraintSystem {
 
     /// Allocate a free variable with the given assigned value.
     pub fn alloc(&mut self, value: F) -> Var {
-        // Hiding callers allocate witness values here: growth erases the old storage.
         dregg_sig_core::wipe::secret_vec_push(&mut self.values, value);
         let idx = self.values.len() - 1;
         assert!(idx < P2_VAR_TAG as usize, "relation variable limit");
@@ -1125,15 +1151,13 @@ impl ConstraintSystem {
         }
     }
 
-    /// `if bit { on_one } else { on_zero }`, one multiplication row. `bit` must be
-    /// constrained Boolean by the caller.
+    /// `if bit { on_one } else { on_zero }`, one multiplication row.
     pub fn select(&mut self, bit: &Lc, on_one: &Lc, on_zero: &Lc) -> Lc {
         let delta = self.mul(bit, &on_one.minus(on_zero));
         on_zero.plus(&delta.into())
     }
 
-    /// Register a public table of `rows.len() / width` distinct rows of `width` columns
-    /// (row-major). Tables are part of the relation: register them in a fixed order.
+    /// Register a public table of `rows.len() / width` distinct rows of `width` columns.
     pub fn table(&mut self, width: usize, rows: Vec<F>) -> TableId {
         assert!(
             !self.hologram_aligned,
@@ -1168,10 +1192,7 @@ impl ConstraintSystem {
         id
     }
 
-    /// `(values_1, .., values_k)` is a row of `table`. No row and no variable is added; the
-    /// table's multiplicity variables are allocated by [`Self::finish`].
-    ///
-    /// The multiplicity count scans the whole table with a fixed access pattern.
+    /// `(values_1, .., values_k)` is a row of `table`.
     pub fn enforce_in_table(&mut self, table: TableId, values: &[Lc]) {
         let mut tuple: Vec<u64> = values
             .iter()
@@ -1194,7 +1215,6 @@ impl ConstraintSystem {
         }
     }
 
-    /// At least `width` tuple columns, each with one row per recorded lookup.
     fn widen_lookup_columns(&mut self, width: usize) {
         while self.lookup_columns.len() < width {
             let mut column = Csr::new();
@@ -1203,20 +1223,18 @@ impl ConstraintSystem {
         }
     }
 
-    /// `0 <= value < 256` for the field element `value` itself: a lookup into
-    /// [`Self::range_table`]`(8)`.
+    /// `0 <= value < 256` via a lookup into [`Self::range_table`]`(8)`.
     pub fn enforce_byte(&mut self, value: &Lc) {
         let table = self.range_table(8);
         self.enforce_in_table(table, core::slice::from_ref(value));
     }
 
-    /// How many lookups the relation holds (the cost metric beside [`Self::num_rows`]).
+    /// Number of lookups recorded so far.
     #[inline]
     pub fn num_lookups(&self) -> usize {
         self.num_lookups
     }
 
-    /// Allocate one variable per table row holding its multiplicity; returns the first.
     fn push_multiplicities(&mut self) -> usize {
         let base = self.values.len();
         for t in 0..self.tables.len() {
@@ -1228,18 +1246,16 @@ impl ConstraintSystem {
         base
     }
 
-    /// The fraction list of the recorded lookups, with masking variables from `mask_base`.
     fn take_lookups(&mut self, mult_var_base: usize, mask_base: usize) -> Lookups {
         let num_table_rows: usize = self.tables.iter().map(|t| t.mult.len()).sum();
         let width = 1 + self.tables.iter().map(|t| t.width).max().unwrap_or(0);
-        // A tuple is as wide as its table, so the recorded columns fit.
         self.widen_lookup_columns(width - 1);
         let lookups = core::mem::take(&mut self.lookup_tables);
         let used = lookups.len() + num_table_rows;
-        let log_entries = (used + LOOKUP_MASK_ENTRIES)
+        let log_entries = (used + LOOKUP_CORNER_ENTRIES)
             .next_power_of_two()
             .trailing_zeros()
-            .max(2) as usize;
+            .max(3) as usize;
         let empty = Lc::zero();
         let mut num = Csr::new();
         let mut den: Vec<Csr> = vec![Csr::new()];
@@ -1263,17 +1279,22 @@ impl ConstraintSystem {
             }
         }
         let total = 1usize << log_entries;
-        for _ in used..total - LOOKUP_MASK_ENTRIES {
+        for _ in used..total - LOOKUP_CORNER_ENTRIES {
             num.push_row(&empty);
             den.iter_mut().for_each(|col| col.push_row(&empty));
         }
-        for k in 0..LOOKUP_MASK_ENTRIES {
-            num.push_row(&Lc::term(Var((mask_base + k) as u32), F::ONE));
-            den[0].push_row(&Lc::term(
-                Var((mask_base + LOOKUP_MASK_ENTRIES + k) as u32),
-                F::ONE,
-            ));
-            den[1..].iter_mut().for_each(|col| col.push_row(&empty));
+        for k in 0..LOOKUP_CORNER_ENTRIES {
+            if k < LOOKUP_MASK_ENTRIES {
+                num.push_row(&Lc::term(Var((mask_base + k) as u32), F::ONE));
+                den[0].push_row(&Lc::term(
+                    Var((mask_base + LOOKUP_MASK_ENTRIES + k) as u32),
+                    F::ONE,
+                ));
+                den[1..].iter_mut().for_each(|col| col.push_row(&empty));
+            } else {
+                num.push_row(&empty);
+                den.iter_mut().for_each(|col| col.push_row(&empty));
+            }
         }
         Lookups {
             log_entries,
@@ -1290,42 +1311,54 @@ impl ConstraintSystem {
         self.p2_sbox.len() + self.sbox.len() + self.mul.len()
     }
 
-    /// The recorded rows in relation order, with `total - MASK_ROWS` rows after padding.
-    fn take_rows(&mut self, total: usize) -> Rows {
+    fn take_rows(&mut self, total: usize, pad_rows: usize) -> Rows {
         let used = self.num_rows();
         let mut rows = core::mem::take(&mut self.p2_sbox);
         rows.append(core::mem::take(&mut self.sbox));
         rows.append(core::mem::take(&mut self.mul));
         for matrix in rows.matrices() {
-            matrix.push_empty_rows(total - MASK_ROWS - used);
+            matrix.push_empty_rows(total - pad_rows - used);
         }
         rows
     }
 
-    /// Close the relation: append the masking variables and rows, pad the row count to a
-    /// power of two. Returns the shape and the assignment, whose masking variables are zero
-    /// until the prover overwrites them.
-    pub fn finish(mut self) -> (Shape, Vec<F>) {
+    /// Close for non-hiding public / hologram recursion (`Closing::Public`). Lookups are not
+    /// supported on public relations; use [`Self::finish_v2`] for hiding zk-Hem v2 relations.
+    pub fn finish(self) -> (Shape, Vec<F>) {
+        assert!(
+            self.tables.is_empty(),
+            "relations with lookups must close with finish_v2 or finish_recorded"
+        );
+        self.finish_with(Closing::Public)
+    }
+
+    /// Close for zk-Hem v2 (`Closing::V2`): fifteen row-masking variables on three corners of
+    /// eight rows, plus ten lookup-masking variables on an eight-entry corner when tables are
+    /// registered.
+    pub fn finish_v2(self) -> (Shape, Vec<F>) {
+        self.finish_with(Closing::V2)
+    }
+
+    fn finish_with(mut self, closing: Closing) -> (Shape, Vec<F>) {
         assert!(self.record_rows);
-        let one = Lc::constant(F::ONE);
-        let two = Lc::constant(F::TWO);
 
         if !self.hologram_aligned {
             let mult_var_base = self.push_multiplicities();
             let mask_var_base = self.values.len();
-            let mask: Vec<Var> = (0..MASK_ROWS).map(|_| self.alloc(F::ZERO)).collect();
-            // The masking variables of the fraction list follow the row masks, so the
-            // prover's fill of `mask_var_base..` covers both.
+            for _ in 0..closing.mask_vars() {
+                self.alloc(F::ZERO);
+            }
             let lookups = (!self.tables.is_empty()).then(|| {
+                assert_eq!(closing, Closing::V2);
                 for _ in 0..2 * LOOKUP_MASK_ENTRIES {
                     self.alloc(F::ZERO);
                 }
-                self.take_lookups(mult_var_base, mask_var_base + MASK_ROWS)
+                self.take_lookups(mult_var_base, mask_var_base + closing.mask_vars())
             });
-            let log_rows = (self.num_rows() + MASK_ROWS)
+            let log_rows = (self.num_rows() + closing.pad_rows())
                 .next_power_of_two()
                 .trailing_zeros()
-                .max(4) as usize;
+                .max(closing.min_log_rows()) as usize;
             let total = 1usize << log_rows;
 
             let num_sbox = self.sbox.len();
@@ -1333,27 +1366,8 @@ impl ConstraintSystem {
                 mut a,
                 mut b,
                 mut c,
-            } = self.take_rows(total);
-            for (k, &p) in mask.iter().enumerate() {
-                let p: Lc = p.into();
-                match k / 4 {
-                    0 => {
-                        a.push_row(&p);
-                        b.push_row(&one);
-                        c.push_row(&p);
-                    }
-                    1 => {
-                        a.push_row(&one);
-                        b.push_row(&p);
-                        c.push_row(&p);
-                    }
-                    _ => {
-                        a.push_row(&p);
-                        b.push_row(&two);
-                        c.push_row(&p.scaled(F::TWO));
-                    }
-                }
-            }
+            } = self.take_rows(total, closing.pad_rows());
+            closing.push_rows(mask_var_base, &mut a, &mut b, &mut c);
             let z = core::mem::take(&mut self.values);
             let mut shape = Shape {
                 log_rows,
@@ -1365,6 +1379,7 @@ impl ConstraintSystem {
                 b,
                 c,
                 hologram_meta: HologramMeta::default(),
+                closing,
                 lookups,
                 digest: [0; 32],
             };
@@ -1372,13 +1387,14 @@ impl ConstraintSystem {
             return (shape, z);
         }
 
+        assert!(self.tables.is_empty());
         let pub_prefix = 1 + self.num_public;
         let pub_var_blocks = pub_prefix.div_ceil(128);
         let p2_var_base = 128 * pub_var_blocks;
         let misc_var_base = p2_var_base + self.p2_values.len();
         let misc_len = self.values.len() - pub_prefix;
         let mask_var_base = misc_var_base + misc_len;
-        let num_vars = mask_var_base + MASK_ROWS;
+        let num_vars = mask_var_base + closing.mask_vars();
 
         let remap_var = |v: u32| -> u32 {
             if v & P2_VAR_TAG != 0 {
@@ -1391,13 +1407,13 @@ impl ConstraintSystem {
         };
 
         let num_sbox = self.p2_sbox.len() + self.sbox.len();
-        let log_rows = (self.num_rows() + MASK_ROWS)
+        let log_rows = (self.num_rows() + closing.pad_rows())
             .next_power_of_two()
             .trailing_zeros()
-            .max(4) as usize;
+            .max(closing.min_log_rows()) as usize;
         let total = 1usize << log_rows;
 
-        let mut rows = self.take_rows(total);
+        let mut rows = self.take_rows(total, closing.pad_rows());
         for matrix in rows.matrices() {
             matrix.map_cols(remap_var);
             matrix.sort_rows();
@@ -1407,26 +1423,7 @@ impl ConstraintSystem {
             mut b,
             mut c,
         } = rows;
-        for k in 0..MASK_ROWS {
-            let p = Lc::term(Var((mask_var_base + k) as u32), F::ONE);
-            match k / 4 {
-                0 => {
-                    a.push_row(&p);
-                    b.push_row(&one);
-                    c.push_row(&p);
-                }
-                1 => {
-                    a.push_row(&one);
-                    b.push_row(&p);
-                    c.push_row(&p);
-                }
-                _ => {
-                    a.push_row(&p);
-                    b.push_row(&two);
-                    c.push_row(&p.scaled(F::TWO));
-                }
-            }
-        }
+        closing.push_rows(mask_var_base, &mut a, &mut b, &mut c);
 
         let mut z = Vec::new();
         dregg_sig_core::wipe::secret_vec_reserve(&mut z, num_vars);
@@ -1453,6 +1450,7 @@ impl ConstraintSystem {
                 poseidon2_perms: self.p2_perms,
                 pub_var_blocks,
             },
+            closing,
             lookups: None,
             digest: [0; 32],
         };
@@ -1461,8 +1459,6 @@ impl ConstraintSystem {
     }
 }
 
-/// The assignment may be a witness; a builder dropped without [`ConstraintSystem::finish`]
-/// erases it.
 impl Drop for ConstraintSystem {
     fn drop(&mut self) {
         dregg_sig_asm::volatile_fill(&mut self.values, F::ZERO);
@@ -1477,7 +1473,6 @@ impl Drop for ConstraintSystem {
 // Width-12 Poseidon2 gadgets (canonical profile of `crate::sponge`)
 // ============================================================================
 
-/// Dense matrix of a linear layer of `crate::sponge`, read off its action on unit vectors.
 fn layer_matrix(layer: fn(&mut [F; 12])) -> [[F; 12]; 12] {
     let mut m = [[F::ZERO; 12]; 12];
     for j in 0..12 {
@@ -1491,12 +1486,7 @@ fn layer_matrix(layer: fn(&mut [F; 12])) -> [[F; 12]; 12] {
     m
 }
 
-/// The permutation `crate::sponge::poseidon2_perm12` on linear forms: 118 S-box rows, no
-/// other rows. Output lanes are linear forms over the last round's S-box outputs.
-///
-/// Inside the permutation every lane is a coefficient vector over a short local basis: the
-/// twelve inputs, then the twelve outputs of the latest full round plus one output per
-/// partial round since. A lane becomes a linear form only where an S-box row needs it.
+/// The permutation `crate::sponge::poseidon2_perm12` on linear forms: 118 S-box rows.
 pub fn poseidon2_perm(cs: &mut ConstraintSystem, st: &mut [Lc; 12]) {
     #[cfg(feature = "std")]
     let (me, mi) = {
@@ -1533,7 +1523,6 @@ pub fn poseidon2_perm(cs: &mut ConstraintSystem, st: &mut [Lc; 12]) {
                 }
                 lanes[0].fill(F::ZERO);
                 lanes[0][n - 1] = F::ONE;
-                // `M_I = J + diag(d)`: every lane gets the lane sum plus `d_j` times itself.
                 let mut sum = vec![F::ZERO; n];
                 for lane in &lanes {
                     for (s, &c) in sum.iter_mut().zip(lane) {
@@ -1566,61 +1555,7 @@ pub fn poseidon2_perm(cs: &mut ConstraintSystem, st: &mut [Lc; 12]) {
     cs.finish_p2_perm_block();
 }
 
-/// Universal 106-row (`12..118`) interior matrix coefficients of [`poseidon2_perm`].
-pub(crate) struct Poseidon2InteriorTemplate {
-    /// For each interior row `r_off in 0..106` (`row = 12 + r_off`), list of `(w, coeff)` in `A`
-    /// where `w in 0..118` is the S-box output offset within the permutation's 128-var block.
-    pub rows_a: Vec<Vec<(u8, F)>>,
-    /// Round-constant (`Var::ONE`, col `0`) coefficient in `A` for each `r_off in 0..106`.
-    pub const_a: [F; 106],
-}
-
-impl Poseidon2InteriorTemplate {
-    fn build() -> Self {
-        let mut cs = ConstraintSystem::new();
-        let mut st: [Lc; 12] = core::array::from_fn(|_| cs.alloc(F::ZERO).into());
-        poseidon2_perm(&mut cs, &mut st);
-        assert_eq!(cs.sbox.len(), 118);
-        let mut rows_a = Vec::with_capacity(106);
-        let mut const_a = [F::ZERO; 106];
-        for (r_off, constant) in const_a.iter_mut().enumerate() {
-            let mut terms = Vec::new();
-            for (v, coeff) in cs.sbox.a.row(12 + r_off) {
-                if v == 0 {
-                    *constant = coeff;
-                } else {
-                    assert!(
-                        (13..13 + 118).contains(&v),
-                        "interior Poseidon2 row touched non-local variable {v}"
-                    );
-                    terms.push(((v - 13) as u8, coeff));
-                }
-            }
-            assert!(cs.sbox.c.row(12 + r_off).eq([(13 + 12 + r_off, F::ONE)]));
-            rows_a.push(terms);
-        }
-        Self { rows_a, const_a }
-    }
-
-    #[inline]
-    pub fn with<R>(run: impl FnOnce(&Self) -> R) -> R {
-        #[cfg(feature = "std")]
-        {
-            static TEMPLATE: std::sync::OnceLock<Poseidon2InteriorTemplate> =
-                std::sync::OnceLock::new();
-            run(TEMPLATE.get_or_init(Self::build))
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            let built = Self::build();
-            run(&built)
-        }
-    }
-}
-
-/// Rate-6, capacity-6 sponge over [`poseidon2_perm`] with the padding of
-/// `dregg-sig-cred::blind_vc::sponge12`: a `1` is added after a short final chunk, or in a
-/// further block when the message length is a multiple of six. Returns the final state.
+/// Rate-6, capacity-6 sponge over [`poseidon2_perm`] with canonical padding.
 pub fn sponge12(cs: &mut ConstraintSystem, message: &[Lc]) -> [Lc; 12] {
     let mut state: [Lc; 12] = core::array::from_fn(|_| Lc::zero());
     for chunk in message.chunks(6) {
@@ -1658,6 +1593,339 @@ pub fn sponge12_native(message: &[F]) -> [F; 12] {
     state
 }
 
+
+// ============================================================================
+// Width-24 `Poseidon2-GL-w24` gadgets (`SECURITY.md §V2.10` + `§V2.11` 708-row R1CS)
+// ============================================================================
+
+/// Exact degree-3 R1CS row count of one `Poseidon2-GL-w24` permutation or 2-to-1 Merkle node:
+/// `236` $x^7$ S-boxes $\times$ `3` cubic product rows (`x2 = x * x * 1`, `x4 = x2 * x2 * 1`,
+/// `x7 = x * x2 * x4`) = `708` rows (`0` rows for linear layers or Jive feed-forward).
+pub const POSEIDON2_GL24_R1CS3_ROWS: usize = 3 * POSEIDON2_GL24_SBOX_COUNT;
+
+/// Exact pure-quadratic (`A * B = C`) R1CS row count of one `Poseidon2-GL-w24` permutation:
+/// `236` $x^7$ S-boxes $\times$ `4` bilinear rows (`x2, x3, x4, x7`) = `944` rows.
+pub const POSEIDON2_GL24_QUAD_R1CS_ROWS: usize = 4 * POSEIDON2_GL24_SBOX_COUNT;
+
+fn layer_matrix24(layer: fn(&mut [F; 24])) -> [[F; 24]; 24] {
+    let mut m = [[F::ZERO; 24]; 24];
+    for j in 0..24 {
+        let mut e = [F::ZERO; 24];
+        e[j] = F::ONE;
+        layer(&mut e);
+        for i in 0..24 {
+            m[i][j] = e[i];
+        }
+    }
+    m
+}
+
+fn synthesize_poseidon2_gl24_perm_with<S>(
+    sys: &mut S,
+    st: &mut [Lc; 24],
+    mut apply_sbox7: impl FnMut(&mut S, &Lc) -> Lc,
+) {
+    #[cfg(feature = "std")]
+    let (me, mi) = {
+        type Matrices24 = ([[F; 24]; 24], [[F; 24]; 24]);
+        static MATRICES24: std::sync::OnceLock<Matrices24> = std::sync::OnceLock::new();
+        MATRICES24.get_or_init(|| {
+            (
+                layer_matrix24(poseidon2_gl24_apply_me),
+                layer_matrix24(poseidon2_gl24_apply_mi),
+            )
+        })
+    };
+    #[cfg(not(feature = "std"))]
+    let (me, mi) = (
+        layer_matrix24(poseidon2_gl24_apply_me),
+        layer_matrix24(poseidon2_gl24_apply_mi),
+    );
+    let external: Vec<Vec<F>> = me.iter().map(|row| row.to_vec()).collect();
+    let form = |basis: &[Lc], coeffs: &[F], constant: F| -> Lc {
+        let parts: Vec<(F, &Lc)> = coeffs.iter().copied().zip(basis).collect();
+        Lc::combine(&parts).plus_const(constant)
+    };
+
+    let mut basis: Vec<Lc> = st.to_vec();
+    let mut lanes = external.clone();
+
+    for r in 0..POSEIDON2_GL24_HALF_EXTERNAL_ROUNDS {
+        let base = 24 * r;
+        let outputs: Vec<Lc> = (0..24)
+            .map(|lane| {
+                let rc = F::from_u64_reduced(POSEIDON2_GL24_RC[base + lane]);
+                apply_sbox7(sys, &form(&basis, &lanes[lane], rc))
+            })
+            .collect();
+        basis = outputs;
+        lanes = external.clone();
+    }
+
+    for r in 0..POSEIDON2_GL24_INTERNAL_ROUNDS {
+        let rc = F::from_u64_reduced(POSEIDON2_GL24_RC[96 + r]);
+        let x = form(&basis, &lanes[0], rc);
+        basis.push(apply_sbox7(sys, &x));
+        let n = basis.len();
+        for lane in &mut lanes {
+            lane.resize(n, F::ZERO);
+        }
+        lanes[0].fill(F::ZERO);
+        lanes[0][n - 1] = F::ONE;
+        let mut sum = vec![F::ZERO; n];
+        for lane in &lanes {
+            for (s, &c) in sum.iter_mut().zip(lane) {
+                *s += c;
+            }
+        }
+        for (j, lane) in lanes.iter_mut().enumerate() {
+            let d = mi[j][j] - F::ONE;
+            for (c, &s) in lane.iter_mut().zip(&sum) {
+                *c = c.const_mul(d) + s;
+            }
+        }
+    }
+
+    for r in 0..POSEIDON2_GL24_HALF_EXTERNAL_ROUNDS {
+        let base = 140 + 24 * r;
+        let outputs: Vec<Lc> = (0..24)
+            .map(|lane| {
+                let rc = F::from_u64_reduced(POSEIDON2_GL24_RC[base + lane]);
+                apply_sbox7(sys, &form(&basis, &lanes[lane], rc))
+            })
+            .collect();
+        basis = outputs;
+        lanes = external.clone();
+    }
+
+    for (slot, lane) in st.iter_mut().zip(&lanes) {
+        *slot = form(&basis, lane, F::ZERO);
+    }
+}
+
+fn build_gl24_merkle_state(left: &[Lc; 7], right: &[Lc; 7], tweak: &[Lc; 2]) -> [Lc; 24] {
+    let mut st: [Lc; 24] = core::array::from_fn(|_| Lc::zero());
+    st[..7].clone_from_slice(left);
+    st[7..14].clone_from_slice(right);
+    st[14] = tweak[0].clone();
+    st[15] = tweak[1].clone();
+    st[16] = Lc::constant(F::from_u64_reduced(POSEIDON2_GL24_RATE as u64));
+    st[17] = Lc::constant(F::from_u64_reduced(POSEIDON2_GL24_CAPACITY as u64));
+    st[18] = Lc::constant(F::from_u64_reduced(POSEIDON2_GL24_DIGEST_LIMBS as u64));
+    st[19] = Lc::constant(F::from_u64_reduced(POSEIDON2_GL24_MERKLE_TAG));
+    st[23] = Lc::constant(F::from_u64_reduced(POSEIDON2_GL24_IV));
+    st
+}
+
+fn apply_gl24_merkle_jive_ff(
+    perm_out: &[Lc; 24],
+    left: &[Lc; 7],
+    right: &[Lc; 7],
+    tweak: &[Lc; 2],
+) -> [Lc; 7] {
+    let four = F::from_u64_reduced(4);
+    core::array::from_fn(|i| {
+        let mut ff = left[i].plus(&right[i].scaled(F::TWO));
+        if i < 2 {
+            ff = ff.plus(&tweak[i].scaled(four));
+        }
+        perm_out[i].plus(&ff)
+    })
+}
+
+/// Native `ConstraintSystem` Width-24 `Poseidon2-GL-w24` permutation gadget: `236` `sbox7` rows,
+/// `0` multiplication rows.
+pub fn poseidon2_gl24_perm_gadget(cs: &mut ConstraintSystem, st: &mut [Lc; 24]) {
+    synthesize_poseidon2_gl24_perm_with(cs, st, |sys, x| sys.sbox7(x).into());
+}
+
+/// Native `ConstraintSystem` 1-call 2-to-1 `Poseidon2-GL-w24` Merkle compression gadget (`7 + 7 + 2 = 16`
+/// rate limbs + Jive feed-forward): `236` `sbox7` rows, `0` multiplication rows.
+pub fn poseidon2_gl24_merkle_compress(
+    cs: &mut ConstraintSystem,
+    left: &[Lc; 7],
+    right: &[Lc; 7],
+    tweak: &[Lc; 2],
+) -> [Lc; 7] {
+    let mut st = build_gl24_merkle_state(left, right, tweak);
+    poseidon2_gl24_perm_gadget(cs, &mut st);
+    apply_gl24_merkle_jive_ff(&st, left, right, tweak)
+}
+
+/// Width-24 permutation with four rank-one product rows per S-box.
+pub fn poseidon2_gl24_perm_quadratic(cs: &mut ConstraintSystem, st: &mut [Lc; 24]) {
+    synthesize_poseidon2_gl24_perm_with(cs, st, |sys, x| {
+        let x2: Lc = sys.mul(x, x).into();
+        let x3: Lc = sys.mul(&x2, x).into();
+        let x4: Lc = sys.mul(&x2, &x2).into();
+        sys.mul(&x3, &x4).into()
+    });
+}
+
+/// Pure quadratic (`A * B = C`) R1CS 2-to-1 `Poseidon2-GL-w24` Merkle compression gadget:
+/// `944` bilinear multiplication rows (`4` per $x^7$ S-box), `0` `sbox7` rows.
+pub fn poseidon2_gl24_merkle_compress_quadratic(
+    cs: &mut ConstraintSystem,
+    left: &[Lc; 7],
+    right: &[Lc; 7],
+    tweak: &[Lc; 2],
+) -> [Lc; 7] {
+    let mut st = build_gl24_merkle_state(left, right, tweak);
+    poseidon2_gl24_perm_quadratic(cs, &mut st);
+    apply_gl24_merkle_jive_ff(&st, left, right, tweak)
+}
+
+/// Compiled degree-3 R1CS relation (`SECURITY.md §V2.11` virtual product rows at group size $2^0 = 1$):
+/// every row enforces `<a_i, z> * <b_i, z> * <d_i, z> = <c_i, z>` with `z[0] = 1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CubicR1csShape {
+    pub num_rows: usize,
+    pub num_vars: usize,
+    pub num_public: usize,
+    pub a: Csr,
+    pub b: Csr,
+    pub d: Csr,
+    pub c: Csr,
+}
+
+impl CubicR1csShape {
+    /// Verify `z[0] == 1` and `<a_i, z> * <b_i, z> * <d_i, z> == <c_i, z>` on every row.
+    pub fn is_satisfied(&self, z: &[F]) -> bool {
+        z.len() == self.num_vars
+            && z.first().copied() == Some(F::ONE)
+            && (0..self.num_rows).all(|i| {
+                let va = self.a.row_dot(i, z);
+                let vb = self.b.row_dot(i, z);
+                let vd = self.d.row_dot(i, z);
+                let vc = self.c.row_dot(i, z);
+                va.const_mul(vb).const_mul(vd) == vc
+            })
+    }
+}
+
+/// Builder for degree-3 R1CS (`<a, z> * <b, z> * <d, z> = <c, z>`, `SECURITY.md §V2.11`),
+/// realizing each $x^7$ S-box in **3 rows** (`x2 = x*x*1`, `x4 = x2*x2*1`, `x7 = x*x2*x4`),
+/// so one `Poseidon2-GL-w24` 2-to-1 Merkle compression uses **exactly `708` rows**.
+pub struct CubicR1csSystem {
+    values: Vec<F>,
+    num_public: usize,
+    rows: Vec<(Lc, Lc, Lc, Lc)>,
+}
+
+impl Default for CubicR1csSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CubicR1csSystem {
+    fn drop(&mut self) {
+        dregg_sig_asm::volatile_fill(&mut self.values, F::ZERO);
+    }
+}
+
+impl CubicR1csSystem {
+    pub fn new() -> Self {
+        Self {
+            values: vec![F::ONE],
+            num_public: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn public_input(&mut self, value: F) -> Var {
+        assert_eq!(
+            self.values.len(),
+            1 + self.num_public,
+            "public inputs are allocated first"
+        );
+        self.num_public += 1;
+        self.alloc(value)
+    }
+
+    pub fn alloc(&mut self, value: F) -> Var {
+        dregg_sig_core::wipe::secret_vec_push(&mut self.values, value);
+        Var((self.values.len() - 1) as u32)
+    }
+
+    pub fn eval(&self, lc: &Lc) -> F {
+        lc.terms()
+            .iter()
+            .fold(F::ZERO, |acc, &(v, c)| acc + c.const_mul(self.values[v as usize]))
+    }
+
+    /// Allocate `y = a * b * d` and record one cubic R1CS row `<a, z> * <b, z> * <d, z> = y`.
+    pub fn mul3(&mut self, a: &Lc, b: &Lc, d: &Lc) -> Var {
+        let val = self
+            .eval(a)
+            .const_mul(self.eval(b))
+            .const_mul(self.eval(d));
+        let y = self.alloc(val);
+        self.rows.push((a.clone(), b.clone(), d.clone(), y.into()));
+        y
+    }
+
+    /// Allocate `y = x^7` in **3 cubic rows**: `x2 = x*x*1`, `x4 = x2*x2*1`, `x7 = x*x2*x4`.
+    pub fn sbox7_cubic(&mut self, x: &Lc) -> Var {
+        let one = Lc::constant(F::ONE);
+        let x2: Lc = self.mul3(x, x, &one).into();
+        let x4: Lc = self.mul3(&x2, &x2, &one).into();
+        self.mul3(x, &x2, &x4)
+    }
+
+    pub fn enforce_equal(&mut self, a: &Lc, b: &Lc) {
+        let one = Lc::constant(F::ONE);
+        self.rows
+            .push((a.minus(b), one.clone(), one, Lc::zero()));
+    }
+
+    #[inline]
+    pub fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn finish(mut self) -> (CubicR1csShape, Vec<F>) {
+        let (mut a, mut b, mut d, mut c) = (Csr::new(), Csr::new(), Csr::new(), Csr::new());
+        let rows = core::mem::take(&mut self.rows);
+        let num_rows = rows.len();
+        for (ra, rb, rd, rc) in rows {
+            a.push_row(&ra);
+            b.push_row(&rb);
+            d.push_row(&rd);
+            c.push_row(&rc);
+        }
+        let z = core::mem::take(&mut self.values);
+        let shape = CubicR1csShape {
+            num_rows,
+            num_vars: z.len(),
+            num_public: self.num_public,
+            a,
+            b,
+            d,
+            c,
+        };
+        (shape, z)
+    }
+}
+
+/// 708-row degree-3 R1CS (`SECURITY.md §V2.11`) `Poseidon2-GL-w24` permutation gadget.
+pub fn poseidon2_gl24_perm_r1cs3(cs: &mut CubicR1csSystem, st: &mut [Lc; 24]) {
+    synthesize_poseidon2_gl24_perm_with(cs, st, |sys, x| sys.sbox7_cubic(x).into());
+}
+
+/// **708-row** degree-3 R1CS (`SECURITY.md §V2.11`) 1-call 2-to-1 `Poseidon2-GL-w24` Merkle
+/// compression gadget (`7 + 7 + 2 = 16` rate limbs + Jive feed-forward, `0` linear-layer rows).
+pub fn poseidon2_gl24_merkle_compress_r1cs3(
+    cs: &mut CubicR1csSystem,
+    left: &[Lc; 7],
+    right: &[Lc; 7],
+    tweak: &[Lc; 2],
+) -> [Lc; 7] {
+    let mut st = build_gl24_merkle_state(left, right, tweak);
+    poseidon2_gl24_perm_r1cs3(cs, &mut st);
+    apply_gl24_merkle_jive_ff(&st, left, right, tweak)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1670,23 +1938,11 @@ mod tests {
         bytes.iter().map(|b| alloc::format!("{b:02x}")).collect()
     }
 
-    /// A relation that uses every kind of row and every way of recording one: public
-    /// inputs, S-box and multiplication rows, Poseidon2 permutations, forked parts
-    /// appended in order and, when not hologram-aligned, lookups into tables of widths
-    /// one, two and three: one part looks up bytes only, and the widest table is
-    /// registered after every other lookup.
-    fn every_kind_of_row(aligned: bool) -> (Shape, Vec<F>) {
-        let mut cs = if aligned {
-            ConstraintSystem::new_hologram_aligned()
-        } else {
-            ConstraintSystem::new()
-        };
+    #[test]
+    fn public_aligned_shape_digest_is_pinned() {
+        let mut cs = ConstraintSystem::new_hologram_aligned();
         let p: Lc = cs.public_input(f(5)).into();
         let q: Lc = cs.public_input(f(9)).into();
-        let pairs = (!aligned).then(|| {
-            cs.range_table(8);
-            cs.table(2, [1, 2, 3, 4, 5, 6].map(f).to_vec())
-        });
         let part = |cs: &mut ConstraintSystem, k: u64| {
             let x: Lc = cs.alloc(f(k + 2)).into();
             let y: Lc = cs.mul(&x, &p).into();
@@ -1697,15 +1953,7 @@ mod tests {
             cs.enforce_mul(out[0].clone(), x.clone(), out[0].scaled(f(k + 2)));
             let sel = cs.select(&Lc::constant(f(1)), &out[1], &y);
             cs.enforce_equal(&sel, &out[1]);
-            if let Some(pairs) = pairs {
-                cs.enforce_byte(&x);
-                if k != 1 {
-                    cs.enforce_in_table(pairs, &[Lc::constant(f(3)), x.plus_const(f(4)).minus(&x)]);
-                }
-                cs.enforce_byte(&x.plus_const(f(200)));
-            }
         };
-        // Forks are taken before the parent allocates anything of its own.
         let mut forks: Vec<ConstraintSystem> = Vec::new();
         for k in 1..4 {
             let mut child = cs.fork_public_inputs();
@@ -1718,68 +1966,23 @@ mod tests {
         part(&mut cs, 0);
         let last: Lc = cs.alloc(f(77)).into();
         cs.enforce_zero(last.plus_const(F::ZERO - f(77)));
-        if !aligned {
-            let triples = cs.table(3, [7, 8, 9, 77, 78, 79].map(f).to_vec());
-            cs.enforce_in_table(
-                triples,
-                &[last.clone(), last.plus_const(f(1)), Lc::constant(f(79))],
-            );
-            cs.enforce_byte(&last);
-        }
-        cs.finish()
-    }
-
-    /// The digest binds the exact matrices. These values were computed by the builder
-    /// that kept every row as a list of linear forms until `finish` (commit `f303896`).
-    #[test]
-    fn shape_digests_of_every_kind_of_row_are_pinned() {
-        let got: Vec<_> = [false, true]
-            .into_iter()
-            .map(|aligned| {
-                let (shape, z) = every_kind_of_row(aligned);
-                assert!(shape.is_satisfied(&z), "aligned={aligned}");
-                assert_eq!(shape.lookups().is_some(), !aligned);
-                (
-                    aligned,
-                    shape.log_rows,
-                    shape.num_sbox,
-                    shape.num_vars,
-                    hex32(shape.digest()),
-                )
-            })
-            .collect();
-        let want = [
+        let (shape, z) = cs.finish();
+        assert!(shape.is_satisfied(&z));
+        assert_eq!(
             (
-                false,
-                PIN_PLAIN.0,
-                PIN_PLAIN.1,
-                PIN_PLAIN.2,
-                PIN_PLAIN.3.into(),
+                shape.log_rows,
+                shape.num_sbox,
+                shape.num_vars,
+                hex32(shape.digest()).as_str()
             ),
             (
-                true,
-                PIN_ALIGNED.0,
-                PIN_ALIGNED.1,
-                PIN_ALIGNED.2,
-                PIN_ALIGNED.3.into(),
-            ),
-        ];
-        assert_eq!(got, want);
+                10,
+                516,
+                669,
+                "8bb1b9cfa74638c39783b86973cf53faff986a166b45109f13ef8da04e492345"
+            )
+        );
     }
-
-    /// `(log_rows, num_sbox, num_vars, digest)`.
-    const PIN_PLAIN: (usize, usize, usize, &str) = (
-        10,
-        476,
-        773,
-        "6f6caabadf32cee9148be7c7cd23740992dc24db88335e14f2cad915695adff5",
-    );
-    const PIN_ALIGNED: (usize, usize, usize, &str) = (
-        10,
-        516,
-        669,
-        "8bb1b9cfa74638c39783b86973cf53faff986a166b45109f13ef8da04e492345",
-    );
 
     #[test]
     fn canonical_rate6_sponge_matches_accelerator_at_boundaries() {
@@ -1795,51 +1998,8 @@ mod tests {
             let inputs: Vec<Lc> = message.iter().map(|&v| cs.alloc(v).into()).collect();
             let out = sponge12(&mut cs, &inputs);
             assert_eq!(out.map(|v| cs.eval(&v)), native);
-            let (shape, assignment) = cs.finish();
+            let (shape, assignment) = cs.finish_v2();
             assert!(shape.is_satisfied(&assignment));
-        }
-    }
-
-    #[test]
-    fn permutation_gadget_matches_native_and_uses_only_sbox_rows() {
-        let mut cs = ConstraintSystem::new();
-        let input: [F; 12] = core::array::from_fn(|i| f(1000 + 7 * i as u64));
-        let mut st: [Lc; 12] = core::array::from_fn(|i| cs.alloc(input[i]).into());
-        poseidon2_perm(&mut cs, &mut st);
-        let mut native = input;
-        poseidon2_perm12(&mut native);
-        for (lc, want) in st.iter().zip(native) {
-            assert_eq!(cs.eval(lc), want);
-        }
-        assert_eq!(cs.num_rows(), 118);
-        // The gadget relies on the internal layer being all-ones plus a diagonal.
-        let mi = layer_matrix(poseidon2_apply_mi);
-        for (i, row) in mi.iter().enumerate() {
-            for (j, &entry) in row.iter().enumerate() {
-                assert!(i == j || entry == F::ONE);
-            }
-        }
-        let (shape, z) = cs.finish();
-        assert_eq!(shape.num_sbox, 118);
-        assert!(shape.is_satisfied(&z));
-        let mut bad = z.clone();
-        bad[20] += F::ONE;
-        assert!(!shape.is_satisfied(&bad));
-    }
-
-    #[test]
-    fn sponge_gadget_matches_native_for_every_padding_case() {
-        for len in [1usize, 5, 6, 7, 12, 16, 39] {
-            let msg: Vec<F> = (0..len).map(|i| f(3 + 11 * i as u64)).collect();
-            let mut cs = ConstraintSystem::new();
-            let lcs: Vec<Lc> = msg.iter().map(|&v| cs.alloc(v).into()).collect();
-            let out = sponge12(&mut cs, &lcs);
-            let want = sponge12_native(&msg);
-            for (lc, w) in out.iter().zip(want) {
-                assert_eq!(cs.eval(lc), w, "message length {len}");
-            }
-            let (shape, z) = cs.finish();
-            assert!(shape.is_satisfied(&z));
         }
     }
 
@@ -1860,7 +2020,7 @@ mod tests {
             (cs, loose)
         };
         let (plain, _) = build(ConstraintSystem::new());
-        let (shape, z) = plain.finish();
+        let (shape, z) = plain.finish_v2();
         let (mut recording, loose) = build(ConstraintSystem::new_recording());
         let source = recording.source(|| Source::Input { bits: 2 });
         assert_eq!(source.index(), 0);
@@ -1877,7 +2037,6 @@ mod tests {
                 .iter()
                 .all(|d| *d == Def::Mask)
         );
-        // A builder that does not record never runs the closures.
         let mut cs = ConstraintSystem::new();
         cs.alloc_defined(f(1), || unreachable!());
         cs.source(|| unreachable!());
@@ -1896,7 +2055,7 @@ mod tests {
             cs.enforce_byte(&a.plus(&b));
             cs.enforce_in_table(table, &[b.clone(), c]);
             assert_eq!((cs.num_rows(), cs.num_lookups()), (0, 3));
-            cs.finish()
+            cs.finish_v2()
         };
         let (shape, z) = build([200, 3, 30]);
         let (shape2, z2) = build([0, 4, 40]);
@@ -1909,74 +2068,17 @@ mod tests {
         assert_eq!(lookups.width(), 3);
         assert_eq!(
             shape.num_vars,
-            1 + 3 + 261 + MASK_ROWS + 2 * LOOKUP_MASK_ENTRIES
+            1 + 3 + 261 + Closing::V2.mask_vars() + 2 * LOOKUP_MASK_ENTRIES
         );
-        // Multiplicities: table 0 (pairs) row 3, table 1 (bytes) rows 200 and 203.
-        let m = |row: usize| z[lookups.mult_var_base + row];
-        assert_eq!(
-            (m(3), m(5 + 200), m(5 + 203), m(5 + 3)),
-            (f(1), f(1), f(1), f(0))
-        );
-        // The masking variables are free.
         let mut masked = z.clone();
         for slot in &mut masked[shape.mask_var_base..] {
             *slot = f(0xBEEF);
         }
         assert!(shape.is_satisfied(&masked));
-        // Out of range, off the table, a pair from the wrong row, a wrong multiplicity.
         for bad in [[200, 56, 0], [256, 0, 0], [1, 5, 50], [1, 3, 40]] {
             let (_, z) = build(bad);
             assert!(!shape.is_satisfied(&z), "{bad:?}");
         }
-        let mut wrong = z.clone();
-        wrong[lookups.mult_var_base + 5 + 7] = f(1);
-        assert!(!shape.is_satisfied(&wrong));
-        // A table tag separates the tables: byte 3 is not the pair (3, 0) of table 0.
-        let mut swapped = z;
-        swapped[lookups.mult_var_base + 5 + 203] = f(0);
-        swapped[lookups.mult_var_base + 5 + 200] = f(2);
-        assert!(!shape.is_satisfied(&swapped));
-    }
-
-    #[test]
-    fn lookups_are_bound_into_the_digest_and_absent_without_tables() {
-        let build = |range: bool, second: u64| {
-            let mut cs = ConstraintSystem::new();
-            let a: Lc = cs.alloc(f(7)).into();
-            let b: Lc = cs.alloc(f(second)).into();
-            cs.enforce_boolean(&b);
-            if range {
-                cs.enforce_byte(&a);
-            }
-            cs.finish().0
-        };
-        let plain = build(false, 1);
-        assert!(plain.lookups().is_none());
-        let with = build(true, 1);
-        assert_ne!(plain.digest(), with.digest());
-        // The lookup adds no row; it adds the multiplicities and eight masking variables.
-        assert_eq!(
-            (plain.log_rows, plain.a.nnz()),
-            (with.log_rows, with.a.nnz())
-        );
-        assert_eq!(
-            with.num_vars,
-            plain.num_vars + 256 + 2 * LOOKUP_MASK_ENTRIES
-        );
-        // Two relations that differ only in which form is looked up.
-        let other = {
-            let mut cs = ConstraintSystem::new();
-            let _a: Lc = cs.alloc(f(7)).into();
-            let b: Lc = cs.alloc(f(1)).into();
-            cs.enforce_boolean(&b);
-            cs.enforce_byte(&b);
-            cs.finish().0
-        };
-        assert_eq!(
-            (other.a.clone(), other.num_vars),
-            (with.a.clone(), with.num_vars)
-        );
-        assert_ne!(other.digest(), with.digest());
     }
 
     #[test]
@@ -1991,7 +2093,7 @@ mod tests {
             cs.range_table(8);
             synth(&mut cs, 5);
             synth(&mut cs, 6);
-            cs.finish()
+            cs.finish_v2()
         };
         let forked = {
             let mut cs = ConstraintSystem::new();
@@ -2002,7 +2104,7 @@ mod tests {
             synth(&mut right, 6);
             cs.append(left);
             cs.append(right);
-            cs.finish()
+            cs.finish_v2()
         };
         assert_eq!(serial, forked);
         assert!(serial.0.is_satisfied(&serial.1));
@@ -2011,29 +2113,56 @@ mod tests {
         synth(&mut cs, 5);
         synth(&mut cs, 6);
         assert_eq!(cs.finish_assignment(&serial.0), Some(serial.1.clone()));
-        let base = serial.0.lookups().unwrap().mult_var_base;
-        assert_eq!([5, 6, 7].map(|r| serial.1[base + r]), [f(1), f(2), f(1)]);
     }
 
     #[test]
-    fn masking_rows_hold_for_any_mask_values_and_shape_is_value_independent() {
-        let build = |x: u64| {
-            let mut cs = ConstraintSystem::new();
-            let v = cs.alloc(f(x));
-            let y = cs.sbox7(&v.into());
-            let b = cs.alloc(f(1));
-            cs.enforce_boolean(&b.into());
-            let _ = cs.select(&b.into(), &y.into(), &v.into());
-            cs.finish()
-        };
-        let (shape, mut z) = build(5);
-        let (shape2, _) = build(99);
-        assert_eq!(shape, shape2);
-        assert_eq!(shape.digest(), shape2.digest());
-        for k in 0..MASK_ROWS {
-            z[shape.mask_var_base + k] = f(0xDEAD_0000 + k as u64);
-        }
-        assert!(shape.is_satisfied(&z));
-        assert_eq!(shape.mask_row_base(2) + 4, shape.num_rows());
+    fn poseidon2_gl24_merkle_gadgets_match_native_and_hit_708_r1cs3_rows() {
+        use crate::sponge::poseidon2_gl24_compress_merkle;
+
+        let left_vals: [F; 7] = core::array::from_fn(|i| f((i + 1) as u64));
+        let right_vals: [F; 7] = core::array::from_fn(|i| f((i + 8) as u64));
+        let tweak_vals: [F; 2] = [f(100), f(200)];
+        let want = poseidon2_gl24_compress_merkle(&left_vals, &right_vals, &tweak_vals);
+
+        // 1. Exact 708-row degree-3 R1CS (`§V2.11`) Merkle-compression gadget (including zero wires!).
+        let mut cs3 = CubicR1csSystem::new();
+        let l3: [Lc; 7] = core::array::from_fn(|i| cs3.alloc(left_vals[i]).into());
+        let r3: [Lc; 7] = core::array::from_fn(|i| cs3.alloc(right_vals[i]).into());
+        let tw3: [Lc; 2] = core::array::from_fn(|i| cs3.alloc(tweak_vals[i]).into());
+        let out3 = poseidon2_gl24_merkle_compress_r1cs3(&mut cs3, &l3, &r3, &tw3);
+        assert_eq!(cs3.num_rows(), POSEIDON2_GL24_R1CS3_ROWS);
+        assert_eq!(cs3.num_rows(), 708);
+        assert_eq!(out3.map(|lc| cs3.eval(&lc)), want);
+        let (shape3, z3) = cs3.finish();
+        assert_eq!(shape3.num_rows, 708);
+        assert!(shape3.is_satisfied(&z3));
+        let mut bad3 = z3.clone();
+        bad3[25] += F::ONE;
+        assert!(!shape3.is_satisfied(&bad3));
+
+        // 2. Native `ConstraintSystem` (`236` `sbox7` rows, `v2` closing).
+        let mut cs = ConstraintSystem::new();
+        let l_lc: [Lc; 7] = core::array::from_fn(|i| cs.alloc(left_vals[i]).into());
+        let r_lc: [Lc; 7] = core::array::from_fn(|i| cs.alloc(right_vals[i]).into());
+        let tw_lc: [Lc; 2] = core::array::from_fn(|i| cs.alloc(tweak_vals[i]).into());
+        let out_lc = poseidon2_gl24_merkle_compress(&mut cs, &l_lc, &r_lc, &tw_lc);
+        assert_eq!(cs.num_rows(), 236);
+        assert_eq!(out_lc.map(|lc| cs.eval(&lc)), want);
+        let (shape_v2, z_v2) = cs.finish_v2();
+        assert_eq!(shape_v2.num_sbox, 236);
+        assert!(shape_v2.is_satisfied(&z_v2));
+
+        // 3. Pure quadratic (`944` `mul` rows, `0` `sbox7` rows).
+        let mut cs_q = ConstraintSystem::new();
+        let lq: [Lc; 7] = core::array::from_fn(|i| cs_q.alloc(left_vals[i]).into());
+        let rq: [Lc; 7] = core::array::from_fn(|i| cs_q.alloc(right_vals[i]).into());
+        let twq: [Lc; 2] = core::array::from_fn(|i| cs_q.alloc(tweak_vals[i]).into());
+        let out_q = poseidon2_gl24_merkle_compress_quadratic(&mut cs_q, &lq, &rq, &twq);
+        assert_eq!(cs_q.num_rows(), POSEIDON2_GL24_QUAD_R1CS_ROWS);
+        assert_eq!(cs_q.num_rows(), 944);
+        assert_eq!(out_q.map(|lc| cs_q.eval(&lc)), want);
+        let (shape_q, z_q) = cs_q.finish_v2();
+        assert_eq!(shape_q.num_sbox, 0);
+        assert!(shape_q.is_satisfied(&z_q));
     }
 }

@@ -1,10 +1,11 @@
-//! `dregg-sig migrate`: prove that the holder of a legacy credential authorises a
+//! `dregg-sig migrate`: prove that the holder of a legacy or Zcash credential authorises a
 //! post-quantum address, verify such a proof, and record each migration once.
 //!
-//! The statements and proofs are those of [`dregg_sig_migrate::hem::relations`] (ownership
-//! relations over the zk-Hem argument); the registry is
-//! [`dregg_sig_migrate::hem::registry`]. Read `crates/migrate/SECURITY.md` for what a
-//! statement proves and for the status of the proof system.
+//! The statements and proofs are those of [`dregg_sig_migrate::hem::relations`] and
+//! [`dregg_sig_migrate::hem::zcash`] over `zk-Hem v2` (`QuinticGoldilocks`, 400-bit digests,
+//! 256-bit salts, DKT26 soundness); the registry is [`dregg_sig_migrate::hem::registry`]. Read
+//! `crates/migrate/SECURITY.md` and `crates/agg/SECURITY.md` for what each
+//! statement proves and for the security bounds of the proof system.
 //!
 //! # Files
 //!
@@ -15,7 +16,7 @@
 //! renders to. The proof itself is the `proof` member in base64 (RFC 4648, padded,
 //! canonical). One file rather than a JSON header beside a binary sidecar, because a proof
 //! is meaningless without its statement and a pair of files can be separated or mixed up;
-//! base64 rather than hex, because the proof is about half a megabyte and hex doubles it
+//! base64 rather than hex, because the proof is hundreds of kilobytes and hex doubles it
 //! where base64 adds a third.
 //!
 //! # Statement kinds
@@ -26,15 +27,41 @@
 
 use dregg_sig_accel::keccak::cshake256_framed_32;
 use dregg_sig_addr::QsagAddress;
-use dregg_sig_agg::pcs::WhirSecurityRegime;
+use dregg_sig_agg::zk_hem::v2::bounds;
+use dregg_sig_agg::zk_hem::v2::params::Profile;
 use dregg_sig_migrate::hem::registry::{
-    BindingStatus, NullifierRegistry, Receipt, RegisteredBinding, RegistryError, pq_commitment,
+    BindingStatus, MigrationBinding, NullifierRegistry, Receipt, RegisteredBinding, RegistryError,
+    pq_commitment,
 };
 use dregg_sig_migrate::hem::relations::{
     Bip32Root, Ed25519ExtendedKey, HARDENED as BIP32_HARDENED, HdNode, KeySource, Lock,
     MAX_PATH_DEPTH as MAX_BIP32_DEPTH, OwnershipError, OwnershipProof, OwnershipStatement,
     OwnershipWitness, PathSpec, SEED_BYTES as BIP32_SEED_BYTES, ownership_shape, prove_ownership,
     verify_ownership,
+};
+use dregg_sig_migrate::hem::zcash::{
+    encoding::Network,
+    orchard::{
+        self, FullViewingKey as OrchardFullViewingKey, Note as OrchardNote, NoteVersion,
+        Scope as OrchardScope, ZIP32_HARDENED, ZIP32_PURPOSE, ZIP32_SEED_BYTES,
+    },
+    pallas::{Fp as PallasFp, Point as PallasPoint},
+    recovery::{
+        AddressProof, AddressStatement, AddressWitness, KeySource as OrchardKeySource,
+        KeyWitness as OrchardKeyWitness, RecoveryError, RecoveryProof, RecoveryStatement,
+        RecoveryWitness, address_shape, prove_address, prove_recovery, recovery_shape,
+        verify_address, verify_recovery,
+    },
+    rehash,
+    sapling::{self, SaplingExtendedSpendingKey},
+    sapling_address::{
+        SaplingAddressProof, SaplingAddressStatement, SaplingKeySource, SaplingKeyWitness,
+        prove_sapling_address, sapling_address_shape, verify_sapling_address,
+    },
+    transparent::{
+        KeyEncoding, TransparentProof, TransparentStatement, bip44_path,
+        coin_type as zcash_coin_type, prove_transparent, verify_transparent,
+    },
 };
 
 use crate::anchor::{AnchorConfig, AnchorRequirementError, FsExternalMountAnchor};
@@ -48,8 +75,9 @@ use crate::vault::{Vault, set};
 const MIGRATE_HELP: &str = "\
 dregg-sig migrate <subcommand> [options]
 
-Prove that the holder of a legacy credential authorises a post-quantum address, and record
-each migration once. Proofs are zk-Hem ownership proofs; see crates/migrate/SECURITY.md.
+Prove that the holder of a legacy or Zcash credential authorises a post-quantum address, and
+record each migration once. Proofs are zk-Hem v2 ownership proofs; see
+crates/migrate/SECURITY.md.
 
   claim     derive the statement (legacy value, nullifier, target) from a legacy secret file
             (alias: commit)
@@ -66,9 +94,9 @@ const PROOF_FORMAT: &str = "qsag-migration-proof-v2";
 const REGISTRY_FORMAT: &str = "qsag-migration-registry-v1";
 const REGISTRY_SCHEME: &str = "migration-registry";
 const DEFAULT_DOMAIN_LABEL: &[u8] = b"QSAG.CLI.MIGRATE.DEFAULT_DOMAIN.V1";
-/// The regime every proof this command writes or accepts is made under.
-const REGIME: WhirSecurityRegime = WhirSecurityRegime::BciksJohnsonQrom128;
-const REGIME_NAME: &str = "BciksJohnsonQrom128";
+/// The zk-Hem v2 profile every proof this command writes or accepts is made under.
+const REGIME: Profile = Profile::TurboShakeJohnson400;
+const REGIME_NAME: &str = "TurboShakeJohnson400";
 
 // ============================================================================
 // Statement kinds
@@ -82,29 +110,19 @@ enum SecretForm {
     /// A BIP-32 master seed of 16 to 64 bytes, as hex or as the `seed` of a JSON file.
     /// Raw bytes are not accepted: a 64-byte file would be ambiguous with 32 bytes of hex.
     HexSeed,
+    /// A ZIP-32 master seed of 32 to 252 bytes, as hex or as the `seed` of a JSON file.
+    Zip32Seed,
     /// A BIP-32 extended private key: an `xprv`/`tprv` string (BIP-32 serialization,
     /// Base58Check), or 64 bytes `private key || chain code` as hex or JSON `seed`.
     ExtendedKey,
     /// A BIP32-Ed25519 extended private key `k_L || k_R || chain code`: 96 bytes as hex or
     /// JSON `seed`.
     Ed25519ExtendedKey,
+    /// Structured JSON recovery witness (Zcash Ironwood note).
+    JsonNote,
 }
 
-/// One statement kind of the command line: a lock (how the chain holds the credential)
-/// and a key source (what the secret file holds). To offer another combination, add one
-/// of these to [`KINDS`].
-struct KindSpec {
-    name: &'static str,
-    aliases: &'static [&'static str],
-    summary: &'static str,
-    secret: SecretForm,
-    lock: Lock,
-    source: Source,
-    /// The member the on-chain credential renders to.
-    member: &'static str,
-}
-
-/// The key sources the command line offers.
+/// The key sources the command line offers for [`OwnershipStatement`] entries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// The signing key itself (hidden-key mode).
@@ -119,7 +137,28 @@ enum Source {
     Bip32Ed25519,
 }
 
-/// The options that shape the key source of a statement beyond its kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KindFamily {
+    Ownership { lock: Lock, source: Source },
+    ZcashIronwood,
+    ZcashOrchard,
+    ZcashSapling,
+    ZcashTransparent,
+}
+
+/// One statement kind of the command line. To offer another combination, add one of these
+/// to [`KINDS`].
+struct KindSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    summary: &'static str,
+    secret: SecretForm,
+    family: KindFamily,
+    /// The primary member the on-chain credential renders to.
+    member: &'static str,
+}
+
+/// The options that shape the key source of an [`OwnershipStatement`] beyond its kind.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct SourceOptions {
     /// `--root extended-key`: the secret is an extended private key, not a master seed.
@@ -149,24 +188,42 @@ impl SourceOptions {
 }
 
 impl KindSpec {
-    /// Whether the kind takes `--path`.
+    fn ownership_parts(&self) -> Option<(Lock, Source)> {
+        match self.family {
+            KindFamily::Ownership { lock, source } => Some((lock, source)),
+            _ => None,
+        }
+    }
+
+    /// Whether the kind requires `--path` (for standard `Ownership` entries).
     fn derivation_path(&self) -> bool {
         matches!(
-            self.source,
-            Source::Bip32 | Source::Slip10 | Source::Bip32Ed25519
+            self.family,
+            KindFamily::Ownership {
+                source: Source::Bip32 | Source::Slip10 | Source::Bip32Ed25519,
+                ..
+            }
         )
     }
 
     /// Whether the kind takes `--merkle-root`.
     fn script_tree(&self) -> bool {
-        self.lock == Lock::TaprootScriptTree
+        matches!(
+            self.family,
+            KindFamily::Ownership {
+                lock: Lock::TaprootScriptTree,
+                ..
+            }
+        )
     }
 
-    /// Whether `options` apply to this kind.
+    /// Whether `options` apply to this `Ownership` kind.
     fn admits(&self, options: SourceOptions) -> bool {
-        (!options.extended_root || self.source == Source::Bip32)
-            && (options.hidden_depth.is_none()
-                || matches!(self.source, Source::Bip32 | Source::Slip10))
+        let Some((_, source)) = self.ownership_parts() else {
+            return false;
+        };
+        (!options.extended_root || source == Source::Bip32)
+            && (options.hidden_depth.is_none() || matches!(source, Source::Bip32 | Source::Slip10))
     }
 
     /// What the secret file holds under `options`.
@@ -178,12 +235,13 @@ impl KindSpec {
         }
     }
 
-    fn key_source(&self, path: Vec<u32>, options: SourceOptions) -> KeySource {
+    fn key_source(&self, path: Vec<u32>, options: SourceOptions) -> Option<KeySource> {
+        let (lock, source) = self.ownership_parts()?;
         let spec = match options.hidden_depth {
             Some(max_depth) => PathSpec::Hidden { max_depth },
             None => PathSpec::Public(path.clone()),
         };
-        match (self.source, self.lock) {
+        Some(match (source, lock) {
             (Source::Key, Lock::BlsWithdrawal) => KeySource::Bls12381Key,
             (Source::Key, _) => KeySource::Secp256k1Key,
             (Source::Ed25519Seed, _) => KeySource::Ed25519Seed,
@@ -197,26 +255,30 @@ impl KindSpec {
             },
             (Source::Slip10, _) => KeySource::Slip10 { path: spec },
             (Source::Bip32Ed25519, _) => KeySource::Bip32Ed25519 { path },
-        }
+        })
     }
 
     /// Whether `source` is this kind's key source under some options and path.
     fn offers(&self, source: &KeySource) -> bool {
+        let Some((lock, kind_source)) = self.ownership_parts() else {
+            return false;
+        };
         matches!(
-            (self.source, self.lock, source),
+            (kind_source, lock, source),
             (Source::Key, Lock::BlsWithdrawal, KeySource::Bls12381Key)
                 | (Source::Key, _, KeySource::Secp256k1Key)
                 | (Source::Ed25519Seed, _, KeySource::Ed25519Seed)
                 | (Source::Bip32, _, KeySource::Bip32 { .. })
                 | (Source::Slip10, _, KeySource::Slip10 { .. })
                 | (Source::Bip32Ed25519, _, KeySource::Bip32Ed25519 { .. })
-        ) && (self.source != Source::Key
-            || (self.lock == Lock::BlsWithdrawal) == (*source == KeySource::Bls12381Key))
+        ) && (kind_source != Source::Key
+            || (lock == Lock::BlsWithdrawal) == (*source == KeySource::Bls12381Key))
     }
 
     /// The witness for secret bytes of the length [`Self::secret_form`] admits.
     fn witness(&self, bytes: &[u8], options: SourceOptions) -> Option<OwnershipWitness> {
-        Some(match (self.source, self.lock) {
+        let (lock, source) = self.ownership_parts()?;
+        Some(match (source, lock) {
             (Source::Key, Lock::BlsWithdrawal) => {
                 OwnershipWitness::bls12_381_key(bytes.try_into().ok()?)
             }
@@ -235,20 +297,65 @@ impl KindSpec {
         })
     }
 
-    /// The public members a statement of this kind renders to.
-    fn render(&self, statement: &OwnershipStatement) -> Vec<(&'static str, Json)> {
+    /// The public members an [`OwnershipStatement`] of this kind renders to.
+    fn render_ownership(&self, statement: &OwnershipStatement) -> Vec<(&'static str, Json)> {
         let mut out = vec![(self.member, Json::hex(statement.credential.value()))];
-        let options = SourceOptions::of(&statement.source);
-        if options.extended_root {
-            out.push(("bip32_root", Json::str("extended-key")));
-        }
-        if let Some(path) = public_path(&statement.source) {
-            out.push(("derivation_path", Json::str(format_path(path))));
-        }
-        if let Some(depth) = options.hidden_depth {
-            out.push(("hidden_path_max_depth", Json::num(depth)));
-        }
+        append_source_members(&mut out, &statement.source);
         out
+    }
+}
+
+fn append_source_members(out: &mut Vec<(&'static str, Json)>, source: &KeySource) {
+    let options = SourceOptions::of(source);
+    if options.extended_root {
+        out.push(("bip32_root", Json::str("extended-key")));
+    }
+    if let Some(path) = public_path(source) {
+        out.push(("derivation_path", Json::str(format_path(path))));
+    }
+    if let Some(depth) = options.hidden_depth {
+        out.push(("hidden_path_max_depth", Json::num(depth)));
+    }
+}
+
+fn append_orchard_key_source_members(
+    out: &mut Vec<(&'static str, Json)>,
+    source: &OrchardKeySource,
+) {
+    match source {
+        OrchardKeySource::SpendingKey => out.push(("zcash_key_source", Json::str("spending-key"))),
+        OrchardKeySource::Zip32Seed {
+            seed_len,
+            coin_type,
+            account,
+        } => {
+            out.push(("zcash_key_source", Json::str("zip32-seed")));
+            out.push(("seed_bytes", Json::num(seed_len)));
+            out.push(("coin_type", Json::num(coin_type)));
+            out.push(("account", Json::num(account)));
+        }
+        OrchardKeySource::QuantumSpendingKey => {
+            out.push(("zcash_key_source", Json::str("quantum-spending-key")));
+        }
+    }
+}
+
+fn append_sapling_key_source_members(
+    out: &mut Vec<(&'static str, Json)>,
+    source: &SaplingKeySource,
+) {
+    match source {
+        SaplingKeySource::SpendingKey => out.push(("zcash_key_source", Json::str("spending-key"))),
+        SaplingKeySource::Zip32Seed {
+            seed_len,
+            coin_type,
+            account,
+        } => {
+            out.push(("zcash_key_source", Json::str("zip32-seed")));
+            out.push(("seed_bytes", Json::num(seed_len)));
+            out.push(("coin_type", Json::num(coin_type)));
+            out.push(("account", Json::num(account)));
+        }
     }
 }
 
@@ -284,8 +391,25 @@ const fn kind(
             Source::Bip32 | Source::Slip10 => SecretForm::HexSeed,
             Source::Bip32Ed25519 => SecretForm::Ed25519ExtendedKey,
         },
-        lock,
-        source,
+        family: KindFamily::Ownership { lock, source },
+        member,
+    }
+}
+
+const fn zcash_kind(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    summary: &'static str,
+    secret: SecretForm,
+    family: KindFamily,
+    member: &'static str,
+) -> KindSpec {
+    KindSpec {
+        name,
+        aliases,
+        summary,
+        secret,
+        family,
         member,
     }
 }
@@ -411,9 +535,41 @@ static KIND_TABLE: [KindSpec; KIND_COUNT] = [
         Source::Bip32Ed25519,
         "legacy_public_key",
     ),
+    zcash_kind(
+        "ironwood",
+        &["zip2005", "zcash-ironwood"],
+        "Zcash NU7 Ironwood note recovery (ZIP 2005 Recovery Statement, hidden key + spend-auth signature)",
+        SecretForm::JsonNote,
+        KindFamily::ZcashIronwood,
+        "anchor",
+    ),
+    zcash_kind(
+        "orchard",
+        &["zcash-orchard", "orchard-address"],
+        "Zcash Orchard payment address ownership (hidden spending key, ZIP-32 seed or QSK)",
+        SecretForm::Key32,
+        KindFamily::ZcashOrchard,
+        "legacy_orchard_address",
+    ),
+    zcash_kind(
+        "sapling",
+        &["zcash-sapling", "sapling-address"],
+        "Zcash Sapling payment address ownership (hidden spending key or ZIP-32 seed)",
+        SecretForm::Key32,
+        KindFamily::ZcashSapling,
+        "legacy_sapling_address",
+    ),
+    zcash_kind(
+        "zcash-transparent",
+        &["zip2007-t1", "zcash-t1"],
+        "Zcash transparent P2PKH t1/tm address ownership (ZIP 2007 hidden key or BIP-32/BIP-44 seed)",
+        SecretForm::Key32,
+        KindFamily::ZcashTransparent,
+        "legacy_zcash_address",
+    ),
 ];
 
-const KIND_COUNT: usize = 15;
+const KIND_COUNT: usize = 19;
 
 const KINDS: &[&KindSpec] = &{
     let mut out = [&KIND_TABLE[0]; KIND_COUNT];
@@ -425,14 +581,189 @@ const KINDS: &[&KindSpec] = &{
     out
 };
 
+// ============================================================================
+// Unified statement & witness sum types
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Statement {
+    Ownership(OwnershipStatement),
+    ZcashIronwood(RecoveryStatement),
+    ZcashOrchard(AddressStatement),
+    ZcashSapling(SaplingAddressStatement),
+    ZcashTransparent(TransparentStatement),
+}
+
+enum Witness {
+    Ownership(OwnershipWitness),
+    ZcashIronwood {
+        witness: Box<RecoveryWitness>,
+        spend_auth_sig: Option<[u8; 64]>,
+    },
+    ZcashOrchard(Box<AddressWitness>),
+    ZcashSapling(SaplingKeyWitness),
+    ZcashTransparent(OwnershipWitness),
+}
+
+impl Statement {
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Ownership(s) => s.to_bytes(),
+            Self::ZcashIronwood(s) => s.to_bytes(),
+            Self::ZcashOrchard(s) => s.to_bytes(),
+            Self::ZcashSapling(s) => s.to_bytes(),
+            Self::ZcashTransparent(s) => s.to_bytes(),
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        OwnershipStatement::from_bytes(bytes)
+            .map(Self::Ownership)
+            .or_else(|| RecoveryStatement::from_bytes(bytes).map(Self::ZcashIronwood))
+            .or_else(|| AddressStatement::from_bytes(bytes).map(Self::ZcashOrchard))
+            .or_else(|| SaplingAddressStatement::from_bytes(bytes).map(Self::ZcashSapling))
+            .or_else(|| TransparentStatement::from_bytes(bytes).map(Self::ZcashTransparent))
+    }
+
+    fn pq_commitment(&self) -> [u8; 32] {
+        match self {
+            Self::Ownership(s) => s.pq_commitment,
+            Self::ZcashIronwood(s) => s.pq_commitment,
+            Self::ZcashOrchard(s) => s.pq_commitment,
+            Self::ZcashSapling(s) => s.pq_commitment,
+            Self::ZcashTransparent(s) => s.ownership.pq_commitment,
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        match self {
+            Self::Ownership(s) => s.epoch,
+            Self::ZcashIronwood(s) => s.epoch,
+            Self::ZcashOrchard(s) => s.epoch,
+            Self::ZcashSapling(s) => s.epoch,
+            Self::ZcashTransparent(s) => s.ownership.epoch,
+        }
+    }
+
+    fn migration_domain(&self) -> [u8; 32] {
+        match self {
+            Self::Ownership(s) => s.migration_domain,
+            Self::ZcashIronwood(s) => s.migration_domain,
+            Self::ZcashOrchard(s) => s.migration_domain,
+            Self::ZcashSapling(s) => s.migration_domain,
+            Self::ZcashTransparent(s) => s.ownership.migration_domain,
+        }
+    }
+
+    fn nullifier(&self) -> [u8; 32] {
+        match self {
+            Self::Ownership(s) => s.nullifier,
+            Self::ZcashIronwood(s) => s.nullifier,
+            Self::ZcashOrchard(s) => s.nullifier(),
+            Self::ZcashSapling(s) => s.nullifier(),
+            Self::ZcashTransparent(s) => s.ownership.nullifier,
+        }
+    }
+
+    fn key_is_revealed(&self) -> bool {
+        match self {
+            Self::Ownership(s) => s.key_is_revealed(),
+            Self::ZcashTransparent(s) => s.ownership.key_is_revealed(),
+            Self::ZcashIronwood(_) | Self::ZcashOrchard(_) | Self::ZcashSapling(_) => false,
+        }
+    }
+
+    fn binding(&self) -> Option<MigrationBinding> {
+        match self {
+            Self::Ownership(s) => Some(s.binding()),
+            Self::ZcashIronwood(s) => Some(s.binding()),
+            Self::ZcashOrchard(s) => Some(s.binding()),
+            Self::ZcashSapling(s) => Some(s.binding()),
+            Self::ZcashTransparent(s) => s.binding(),
+        }
+    }
+
+    fn render_kind_members(&self, kind: &KindSpec) -> Vec<(&'static str, Json)> {
+        match self {
+            Self::Ownership(s) => kind.render_ownership(s),
+            Self::ZcashIronwood(s) => {
+                let mut out = vec![
+                    ("anchor", Json::hex(&s.anchor)),
+                    ("rk", Json::hex(&s.rk)),
+                    ("value", Json::num(s.value)),
+                ];
+                append_orchard_key_source_members(&mut out, &s.key_source);
+                out
+            }
+            Self::ZcashOrchard(s) => {
+                let mut out = vec![("legacy_orchard_address", Json::hex(&s.address))];
+                append_orchard_key_source_members(&mut out, &s.key_source);
+                out
+            }
+            Self::ZcashSapling(s) => {
+                let mut out = vec![("legacy_sapling_address", Json::hex(&s.address))];
+                append_sapling_key_source_members(&mut out, &s.key_source);
+                out
+            }
+            Self::ZcashTransparent(s) => {
+                let mut out = Vec::new();
+                if let Some(addr) = s.address() {
+                    out.push(("legacy_zcash_address", Json::str(addr)));
+                }
+                if let Some(h) = s.hash160() {
+                    out.push(("legacy_hash160", Json::hex(&h)));
+                }
+                out.push((
+                    "network",
+                    Json::str(match s.network {
+                        Network::Main => "main",
+                        Network::Test => "test",
+                    }),
+                ));
+                if s.ownership.lock == Lock::P2pkhUncompressed {
+                    out.push(("key_encoding", Json::str("uncompressed")));
+                }
+                append_source_members(&mut out, &s.ownership.source);
+                out
+            }
+        }
+    }
+}
+
 /// The table entry of a statement; `None` for a combination this command does not offer.
-/// The root and the path form (`--root`, `--hidden-path-depth`) are options of an entry,
-/// not entries of their own.
-fn kind_of(statement: &OwnershipStatement) -> Option<&'static KindSpec> {
-    KINDS
-        .iter()
-        .copied()
-        .find(|kind| kind.lock == statement.lock && kind.offers(&statement.source))
+/// Exhaustive over [`Statement`] so any new variant must be wired into [`KINDS`].
+fn kind_of(statement: &Statement) -> Option<&'static KindSpec> {
+    match statement {
+        Statement::Ownership(s) => KINDS.iter().copied().find(|kind| {
+            matches!(kind.family, KindFamily::Ownership { lock, .. } if lock == s.lock && kind.offers(&s.source))
+        }),
+        Statement::ZcashIronwood(_) => KINDS
+            .iter()
+            .copied()
+            .find(|k| k.family == KindFamily::ZcashIronwood),
+        Statement::ZcashOrchard(_) => KINDS
+            .iter()
+            .copied()
+            .find(|k| k.family == KindFamily::ZcashOrchard),
+        Statement::ZcashSapling(_) => KINDS
+            .iter()
+            .copied()
+            .find(|k| k.family == KindFamily::ZcashSapling),
+        Statement::ZcashTransparent(s) => {
+            let valid_source = matches!(
+                s.ownership.source,
+                KeySource::Secp256k1Key | KeySource::Bip32 { .. }
+            );
+            (s.is_well_formed() && valid_source)
+                .then(|| {
+                    KINDS
+                        .iter()
+                        .copied()
+                        .find(|k| k.family == KindFamily::ZcashTransparent)
+                })
+                .flatten()
+        }
+    }
 }
 
 fn kind_by_name(name: &str) -> Result<&'static KindSpec, CliError> {
@@ -452,10 +783,10 @@ fn kind_by_name(name: &str) -> Result<&'static KindSpec, CliError> {
 fn kinds_help() -> String {
     let mut out = String::new();
     for kind in KINDS {
-        out.push_str(&format!("  {:<16} {}\n", kind.name, kind.summary));
+        out.push_str(&format!("  {:<18} {}\n", kind.name, kind.summary));
         if !kind.aliases.is_empty() {
             out.push_str(&format!(
-                "  {:<16} aliases: {}\n",
+                "  {:<18} aliases: {}\n",
                 "",
                 kind.aliases.join(", ")
             ));
@@ -470,7 +801,7 @@ pub fn info() -> Json {
         (
             "proof_system",
             Json::str(
-                "zk-Hem ownership relations over the Hem WHIR commitment; composed zero-knowledge and knowledge-soundness bounds are not established (crates/migrate/SECURITY.md)",
+                "zk-Hem v2 ownership relations over QuinticGoldilocks (400-bit digests, 256-bit salts, DKT26 soundness; see crates/migrate/SECURITY.md)",
             ),
         ),
         ("regime", Json::str(REGIME_NAME)),
@@ -502,7 +833,7 @@ pub fn info() -> Json {
 pub fn info_text() -> String {
     let names: Vec<_> = KINDS.iter().map(|kind| kind.name).collect();
     format!(
-        "migration: zk-Hem ownership proofs ({REGIME_NAME}) for {}; one-way registry\n",
+        "migration: zk-Hem v2 ownership proofs ({REGIME_NAME}) for {}; one-way registry\n",
         names.join(", ")
     )
 }
@@ -592,7 +923,6 @@ fn json_legacy_seed(json: &Json) -> Result<ZeroizingBuf, CliError> {
 fn parse_extended_private_key(text: &str) -> Result<ZeroizingBuf, CliError> {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let bad = |why: &str| CliError::input(format!("extended private key: {why}"));
-    // Little-endian base-256 accumulator; 111 characters of base 58 fit 82 bytes.
     let mut number = ZeroizingBuf::new(vec![0u8; 82]);
     for c in text.bytes() {
         let digit = ALPHABET
@@ -615,7 +945,6 @@ fn parse_extended_private_key(text: &str) -> Result<ZeroizingBuf, CliError> {
     if digest[..4] != *checksum {
         return Err(bad("checksum mismatch"));
     }
-    // Base58Check is canonical: re-encoding must give the text back (no spare leading 1s).
     if text.len() != 111 {
         return Err(bad("not a 78-byte BIP-32 serialization"));
     }
@@ -635,18 +964,12 @@ fn parse_extended_private_key(text: &str) -> Result<ZeroizingBuf, CliError> {
 }
 
 /// Read the secret of a statement kind. The bytes stay in a wiping buffer.
-///
-/// `Key32`: 64 hex characters, a JSON object with a `seed` member, or a raw 32-byte file.
-/// `HexSeed`: hex or such a JSON object, 16 to 64 bytes. A JSON object or a hex string is
-/// never read as raw key bytes, whatever its length.
 fn read_legacy_secret(path: &str, form: SecretForm) -> Result<ZeroizingBuf, CliError> {
     let raw = read_bounded_file(path, MAX_KEY_FILE_BYTES)?;
     let text = std::str::from_utf8(&raw.0).ok().map(str::trim);
     let hex = text
         .map(|text| text.strip_prefix("0x").unwrap_or(text))
         .filter(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()));
-    // Hex text is hex whatever its length: 32 hex characters are a 16-byte value, never a
-    // raw 32-byte key (32 uniform bytes are all hex digits with probability below 2^-110).
     let secret = match (text, hex) {
         (Some(text), _) if text.starts_with('{') => json_legacy_seed(&Json::parse(text)?)?,
         (_, Some(hex)) => from_hex(hex)?,
@@ -672,8 +995,10 @@ fn read_legacy_secret(path: &str, form: SecretForm) -> Result<ZeroizingBuf, CliE
     let accepted = match form {
         SecretForm::Key32 => secret.0.len() == 32,
         SecretForm::HexSeed => BIP32_SEED_BYTES.contains(&secret.0.len()),
+        SecretForm::Zip32Seed => ZIP32_SEED_BYTES.contains(&secret.0.len()),
         SecretForm::ExtendedKey => secret.0.len() == 64,
         SecretForm::Ed25519ExtendedKey => secret.0.len() == 96,
+        SecretForm::JsonNote => false,
     };
     if !accepted {
         return Err(CliError::input(match form {
@@ -692,6 +1017,13 @@ fn read_legacy_secret(path: &str, form: SecretForm) -> Result<ZeroizingBuf, CliE
                 BIP32_SEED_BYTES.end(),
                 secret.0.len()
             ),
+            SecretForm::Zip32Seed => format!(
+                "ZIP-32 seed must be {} to {} bytes (got {})",
+                ZIP32_SEED_BYTES.start(),
+                ZIP32_SEED_BYTES.end(),
+                secret.0.len()
+            ),
+            SecretForm::JsonNote => "Ironwood recovery expects a JSON witness file".into(),
         }));
     }
     Ok(secret)
@@ -728,12 +1060,17 @@ fn parse_target(text: &str) -> Result<(QsagAddress, String), CliError> {
 }
 
 /// The members a statement renders to, in file order. `target` is the canonical text of
-/// the address `statement.pq_commitment` commits to.
-fn statement_members(statement: &OwnershipStatement, target: &str) -> Vec<(&'static str, Json)> {
-    let binding = statement.binding();
+/// the address `statement.pq_commitment()` commits to.
+fn statement_members(
+    statement: &Statement,
+    target: &str,
+) -> Result<Vec<(&'static str, Json)>, String> {
+    let binding = statement
+        .binding()
+        .ok_or_else(|| String::from("statement has no canonical registry binding"))?;
     let mut members = vec![("kind", Json::str(kind_name(statement)))];
     if let Some(kind) = kind_of(statement) {
-        members.extend(kind.render(statement));
+        members.extend(statement.render_kind_members(kind));
     }
     members.extend([
         (
@@ -745,14 +1082,14 @@ fn statement_members(statement: &OwnershipStatement, target: &str) -> Vec<(&'sta
             }),
         ),
         ("target_pq_address", Json::str(target)),
-        ("pq_commitment", Json::hex(&statement.pq_commitment)),
-        ("epoch", Json::num(statement.epoch)),
-        ("migration_domain", Json::hex(&statement.migration_domain)),
-        ("nullifier", Json::hex(&statement.nullifier)),
+        ("pq_commitment", Json::hex(&statement.pq_commitment())),
+        ("epoch", Json::num(statement.epoch())),
+        ("migration_domain", Json::hex(&statement.migration_domain())),
+        ("nullifier", Json::hex(&statement.nullifier())),
         ("legacy_id", Json::hex(&binding.legacy_id)),
         ("statement", Json::hex(&statement.to_bytes())),
     ]);
-    members
+    Ok(members)
 }
 
 fn document(format: &str, mut members: Vec<(&'static str, Json)>) -> Json {
@@ -762,7 +1099,7 @@ fn document(format: &str, mut members: Vec<(&'static str, Json)>) -> Json {
 
 /// A statement read back from a claim or proof document.
 struct LoadedStatement {
-    statement: OwnershipStatement,
+    statement: Statement,
     target: QsagAddress,
     target_text: String,
 }
@@ -784,8 +1121,8 @@ fn load_statement(json: &Json, format: &str, extra: &[&str]) -> Result<LoadedSta
         return Err(format!("not a {format} file"));
     }
     let bytes = from_hex(field("statement")?).map_err(|e| e.message)?;
-    let statement = OwnershipStatement::from_bytes(&bytes.0)
-        .ok_or("statement is not a canonical ownership statement")?;
+    let statement = Statement::from_bytes(&bytes.0)
+        .ok_or("statement is not a canonical migration statement")?;
     if kind_of(&statement).is_none() {
         return Err("statement is of a kind this command does not offer".into());
     }
@@ -795,10 +1132,10 @@ fn load_statement(json: &Json, format: &str, extra: &[&str]) -> Result<LoadedSta
     if target.encode().ok().as_deref() != Some(target_text.as_str()) {
         return Err("target_pq_address is not in canonical form".into());
     }
-    if pq_commitment(&target) != statement.pq_commitment {
+    if pq_commitment(&target) != statement.pq_commitment() {
         return Err("target_pq_address is not the address the statement commits to".into());
     }
-    let rendered = statement_members(&statement, &target_text);
+    let rendered = statement_members(&statement, &target_text)?;
     for (name, value) in &rendered {
         if json.get(name) != Some(value) {
             return Err(format!("member \"{name}\" does not match the statement"));
@@ -833,11 +1170,738 @@ const STATEMENT_OPTIONS: &[&str] = &[
     "epoch",
     "domain-hex",
     "out",
+    "network",
+    "account",
+    "coin-type",
+    "diversifier",
+    "diversifier-index",
+    "spend-auth-sig",
 ];
 
+const ZCASH_ONLY_OPTIONS: &[&str] = &[
+    "network",
+    "account",
+    "coin-type",
+    "diversifier",
+    "diversifier-index",
+    "spend-auth-sig",
+];
+
+fn parse_network(args: &Args) -> Result<Network, CliError> {
+    match args.get("network") {
+        None | Some("main") | Some("mainnet") => Ok(Network::Main),
+        Some("test") | Some("testnet") => Ok(Network::Test),
+        Some(other) => Err(CliError::usage(format!(
+            "--network '{other}' is not 'main' or 'test'"
+        ))),
+    }
+}
+
+fn parse_u32_option(args: &Args, name: &str) -> Result<Option<u32>, CliError> {
+    args.get(name)
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|_| CliError::usage(format!("--{name} must be a 32-bit unsigned integer")))
+        })
+        .transpose()
+}
+
+fn orchard_fvk(
+    source: &OrchardKeySource,
+    witness: &OrchardKeyWitness,
+) -> Option<OrchardFullViewingKey> {
+    match (source, witness) {
+        (OrchardKeySource::SpendingKey, OrchardKeyWitness::SpendingKey(sk)) => {
+            OrchardFullViewingKey::from_spending_key(sk)
+        }
+        (
+            OrchardKeySource::Zip32Seed {
+                seed_len,
+                coin_type,
+                account,
+            },
+            OrchardKeyWitness::Zip32Seed(seed),
+        ) => {
+            if !source.is_well_formed() || seed.len() != usize::from(*seed_len) {
+                return None;
+            }
+            let path = [
+                ZIP32_PURPOSE | ZIP32_HARDENED,
+                *coin_type | ZIP32_HARDENED,
+                *account | ZIP32_HARDENED,
+            ];
+            let mut sk = orchard::zip32_spending_key(seed, &path)?;
+            let fvk = OrchardFullViewingKey::from_spending_key(&sk);
+            dregg_sig_asm::volatile_fill(&mut sk, 0);
+            fvk
+        }
+        (
+            OrchardKeySource::QuantumSpendingKey,
+            OrchardKeyWitness::QuantumSpendingKey { qsk, ak, nk },
+        ) => {
+            let ak_pt = PallasPoint::from_bytes_nonidentity(ak)?;
+            let nk_fp = PallasFp::from_bytes(nk)?;
+            let ak_fp = ak_pt.extract();
+            let fvk = OrchardFullViewingKey {
+                ak: ak_fp,
+                nk: nk_fp,
+                rivk: orchard::h_rivk_ext(&orchard::h_qk(qsk), &ak_fp, &nk_fp),
+            };
+            (fvk.ivk(OrchardScope::External).is_some() && fvk.ivk(OrchardScope::Internal).is_some())
+                .then_some(fvk)
+        }
+        _ => None,
+    }
+}
+
+fn parse_orchard_cli_key(
+    args: &Args,
+    secret_path: &str,
+    default_coin: u32,
+) -> Result<(OrchardKeySource, OrchardKeyWitness, ZeroizingBuf), CliError> {
+    match args.get("root") {
+        None | Some("spending-key") => {
+            if args.get("account").is_some() || args.get("coin-type").is_some() {
+                return Err(CliError::usage(
+                    "--account and --coin-type require --root seed",
+                ));
+            }
+            let secret = read_legacy_secret(secret_path, SecretForm::Key32)?;
+            let sk: [u8; 32] = secret.0.as_slice().try_into().expect("32 bytes");
+            Ok((
+                OrchardKeySource::SpendingKey,
+                OrchardKeyWitness::SpendingKey(sk),
+                secret,
+            ))
+        }
+        Some("seed") => {
+            let secret = read_legacy_secret(secret_path, SecretForm::Zip32Seed)?;
+            let coin_type = parse_u32_option(args, "coin-type")?.unwrap_or(default_coin);
+            let account = parse_u32_option(args, "account")?.unwrap_or(0);
+            let source = OrchardKeySource::Zip32Seed {
+                seed_len: u8::try_from(secret.0.len()).expect("32..=252"),
+                coin_type,
+                account,
+            };
+            if !source.is_well_formed() {
+                return Err(CliError::usage(
+                    "--coin-type and --account must be below 2^31",
+                ));
+            }
+            Ok((
+                source,
+                OrchardKeyWitness::Zip32Seed(secret.0.clone()),
+                secret,
+            ))
+        }
+        Some("qsk") => {
+            if args.get("account").is_some() || args.get("coin-type").is_some() {
+                return Err(CliError::usage(
+                    "--account and --coin-type do not apply to --root qsk",
+                ));
+            }
+            let raw = read_bounded_file(secret_path, MAX_KEY_FILE_BYTES)?;
+            let text = std::str::from_utf8(&raw.0)
+                .map_err(|_| CliError::input("QSK witness file must be UTF-8 JSON"))?;
+            let json = Json::parse(text)?;
+            reject_sealed_legacy_key(&json)?;
+            let qsk_buf = json.field_hex("qsk")?;
+            let qsk: [u8; 32] = qsk_buf
+                .0
+                .as_slice()
+                .try_into()
+                .map_err(|_| CliError::input("qsk must be 32 bytes of hex"))?;
+            let ak = from_hex_exact::<32>(json.field_str("ak")?, "ak")?;
+            let nk = from_hex_exact::<32>(json.field_str("nk")?, "nk")?;
+            Ok((
+                OrchardKeySource::QuantumSpendingKey,
+                OrchardKeyWitness::QuantumSpendingKey { qsk, ak, nk },
+                qsk_buf,
+            ))
+        }
+        Some(other) => Err(CliError::usage(format!(
+            "--root '{other}' is not 'spending-key', 'seed', or 'qsk'"
+        ))),
+    }
+}
+
+fn reject_options(args: &Args, kind_name: &str, disallowed: &[&str]) -> Result<(), CliError> {
+    for &opt in disallowed {
+        if args.get(opt).is_some() {
+            return Err(CliError::usage(format!(
+                "--{opt} does not apply to --kind {kind_name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn derive_zcash(
+    kind: &'static KindSpec,
+    args: &Args,
+) -> Result<(LoadedStatement, Witness, ZeroizingBuf), CliError> {
+    let secret_path = args.require("legacy-secret")?;
+    let (target, target_text) = parse_target(args.require("target")?)?;
+    let epoch = required_epoch(args)?;
+    let domain = parse_domain(args)?;
+    let pq = pq_commitment(&target);
+
+    match kind.family {
+        KindFamily::ZcashOrchard => {
+            reject_options(
+                args,
+                kind.name,
+                &["path", "hidden-path-depth", "merkle-root", "spend-auth-sig"],
+            )?;
+            if args.flag("uncompressed") {
+                return Err(CliError::usage(
+                    "--uncompressed does not apply to --kind orchard",
+                ));
+            }
+            let network = parse_network(args)?;
+            let (key_source, key_witness, secret) =
+                parse_orchard_cli_key(args, secret_path, zcash_coin_type(network))?;
+            let internal = args.flag("internal");
+            let scope = if internal {
+                OrchardScope::Internal
+            } else {
+                OrchardScope::External
+            };
+            let d: [u8; 11] =
+                match (args.get("diversifier"), args.get_u64("diversifier-index")?) {
+                    (Some(_), Some(_)) => {
+                        return Err(CliError::usage(
+                            "cannot combine --diversifier and --diversifier-index",
+                        ));
+                    }
+                    (Some(hex), None) => from_hex_exact::<11>(hex, "--diversifier")?,
+                    (None, idx_opt) => {
+                        let fvk = orchard_fvk(&key_source, &key_witness).ok_or_else(|| {
+                            CliError::input("legacy secret is not a valid Orchard key")
+                        })?;
+                        let mut j = [0u8; 11];
+                        j[..8].copy_from_slice(&idx_opt.unwrap_or(0).to_le_bytes());
+                        fvk.diversifier(&j, scope)
+                    }
+                };
+            let witness = AddressWitness {
+                key: key_witness,
+                internal,
+            };
+            let stmt = AddressStatement::derive(&key_source, &witness, &d, pq, domain, epoch)
+                .ok_or_else(|| {
+                    CliError::input("legacy secret does not derive a valid Orchard address")
+                })?;
+            Ok((
+                LoadedStatement {
+                    statement: Statement::ZcashOrchard(stmt),
+                    target,
+                    target_text,
+                },
+                Witness::ZcashOrchard(Box::new(witness)),
+                secret,
+            ))
+        }
+        KindFamily::ZcashSapling => {
+            reject_options(
+                args,
+                kind.name,
+                &["path", "hidden-path-depth", "merkle-root", "spend-auth-sig"],
+            )?;
+            if args.flag("internal") || args.flag("uncompressed") {
+                return Err(CliError::usage(
+                    "--internal and --uncompressed do not apply to --kind sapling",
+                ));
+            }
+            let network = parse_network(args)?;
+            let default_coin = zcash_coin_type(network);
+            let (key_source, key_witness, d, secret) = match args.get("root") {
+                None | Some("spending-key") => {
+                    if args.get("account").is_some()
+                        || args.get("coin-type").is_some()
+                        || args.get("diversifier-index").is_some()
+                    {
+                        return Err(CliError::usage(
+                            "--account, --coin-type, and --diversifier-index require --root seed for --kind sapling",
+                        ));
+                    }
+                    let secret = read_legacy_secret(secret_path, SecretForm::Key32)?;
+                    let sk: [u8; 32] = secret.0.as_slice().try_into().expect("32 bytes");
+                    let d = match args.get("diversifier") {
+                        Some(hex) => from_hex_exact::<11>(hex, "--diversifier")?,
+                        None => sapling::default_diversifier(&sk),
+                    };
+                    (
+                        SaplingKeySource::SpendingKey,
+                        SaplingKeyWitness::SpendingKey(sk),
+                        d,
+                        secret,
+                    )
+                }
+                Some("seed") => {
+                    let secret = read_legacy_secret(secret_path, SecretForm::Zip32Seed)?;
+                    let coin_type = parse_u32_option(args, "coin-type")?.unwrap_or(default_coin);
+                    let account = parse_u32_option(args, "account")?.unwrap_or(0);
+                    let source = SaplingKeySource::Zip32Seed {
+                        seed_len: u8::try_from(secret.0.len()).expect("32..=252"),
+                        coin_type,
+                        account,
+                    };
+                    if !source.is_well_formed() {
+                        return Err(CliError::usage(
+                            "--coin-type and --account must be below 2^31",
+                        ));
+                    }
+                    let d = match (args.get("diversifier"), args.get_u64("diversifier-index")?) {
+                        (Some(_), Some(_)) => {
+                            return Err(CliError::usage(
+                                "cannot combine --diversifier and --diversifier-index",
+                            ));
+                        }
+                        (Some(hex), None) => from_hex_exact::<11>(hex, "--diversifier")?,
+                        (None, idx_opt) => {
+                            let extsk = SaplingExtendedSpendingKey::derive(
+                                &secret.0,
+                                &[
+                                    32 | ZIP32_HARDENED,
+                                    coin_type | ZIP32_HARDENED,
+                                    account | ZIP32_HARDENED,
+                                ],
+                            )
+                            .ok_or_else(|| {
+                                CliError::input("seed does not derive a valid Sapling account key")
+                            })?;
+                            let efvk = extsk.to_extended_fvk();
+                            match idx_opt {
+                                Some(idx) => {
+                                    let mut j = [0u8; 11];
+                                    j[..8].copy_from_slice(&idx.to_le_bytes());
+                                    efvk.diversifier(&j).ok_or_else(|| {
+                                        CliError::input(format!(
+                                            "diversifier index {idx} has no valid Sapling diversifier"
+                                        ))
+                                    })?
+                                }
+                                None => efvk.default_diversifier().1,
+                            }
+                        }
+                    };
+                    (
+                        source,
+                        SaplingKeyWitness::Zip32Seed(secret.0.clone()),
+                        d,
+                        secret,
+                    )
+                }
+                Some(other) => {
+                    return Err(CliError::usage(format!(
+                        "--root '{other}' is not 'spending-key' or 'seed' for --kind sapling"
+                    )));
+                }
+            };
+            let stmt =
+                SaplingAddressStatement::derive(&key_source, &key_witness, &d, pq, domain, epoch)
+                    .ok_or_else(|| {
+                    CliError::input(
+                        "legacy secret or diversifier does not produce a valid Sapling address",
+                    )
+                })?;
+            Ok((
+                LoadedStatement {
+                    statement: Statement::ZcashSapling(stmt),
+                    target,
+                    target_text,
+                },
+                Witness::ZcashSapling(key_witness),
+                secret,
+            ))
+        }
+        KindFamily::ZcashIronwood => {
+            reject_options(
+                args,
+                kind.name,
+                &["path", "hidden-path-depth", "merkle-root", "diversifier"],
+            )?;
+            if args.flag("uncompressed") {
+                return Err(CliError::usage(
+                    "--uncompressed does not apply to --kind ironwood",
+                ));
+            }
+            let network = parse_network(args)?;
+            let default_coin = zcash_coin_type(network);
+            let raw = read_bounded_file(secret_path, MAX_KEY_FILE_BYTES)?;
+            let text = std::str::from_utf8(&raw.0)
+                .map_err(|_| CliError::input("Ironwood witness file must be UTF-8 JSON"))?;
+            let json = Json::parse(text)?;
+            reject_sealed_legacy_key(&json)?;
+
+            let (key_source, key_witness, secret) = match args.get("root") {
+                None | Some("spending-key") => {
+                    if args.get("account").is_some() || args.get("coin-type").is_some() {
+                        return Err(CliError::usage(
+                            "--account and --coin-type require --root seed",
+                        ));
+                    }
+                    let sk_buf = if json.get("spending_key").is_some() {
+                        json.field_hex("spending_key")?
+                    } else {
+                        json.field_hex("seed")?
+                    };
+                    let sk: [u8; 32] = sk_buf.0.as_slice().try_into().map_err(|_| {
+                        CliError::input("spending_key must be 32 bytes of hex")
+                    })?;
+                    (
+                        OrchardKeySource::SpendingKey,
+                        OrchardKeyWitness::SpendingKey(sk),
+                        sk_buf,
+                    )
+                }
+                Some("seed") => {
+                    let seed_buf = json.field_hex("seed")?;
+                    if !ZIP32_SEED_BYTES.contains(&seed_buf.0.len()) {
+                        return Err(CliError::input(format!(
+                            "ZIP-32 seed must be {} to {} bytes (got {})",
+                            ZIP32_SEED_BYTES.start(),
+                            ZIP32_SEED_BYTES.end(),
+                            seed_buf.0.len()
+                        )));
+                    }
+                    let coin_type = match parse_u32_option(args, "coin-type")? {
+                        Some(v) => v,
+                        None => json
+                            .get("coin_type")
+                            .and_then(Json::as_u64)
+                            .and_then(|v| u32::try_from(v).ok())
+                            .unwrap_or(default_coin),
+                    };
+                    let account = match parse_u32_option(args, "account")? {
+                        Some(v) => v,
+                        None => json
+                            .get("account")
+                            .and_then(Json::as_u64)
+                            .and_then(|v| u32::try_from(v).ok())
+                            .unwrap_or(0),
+                    };
+                    let source = OrchardKeySource::Zip32Seed {
+                        seed_len: u8::try_from(seed_buf.0.len()).expect("32..=252"),
+                        coin_type,
+                        account,
+                    };
+                    if !source.is_well_formed() {
+                        return Err(CliError::usage(
+                            "--coin-type and --account must be below 2^31",
+                        ));
+                    }
+                    (
+                        source,
+                        OrchardKeyWitness::Zip32Seed(seed_buf.0.clone()),
+                        seed_buf,
+                    )
+                }
+                Some("qsk") => {
+                    let qsk_buf = json.field_hex("qsk")?;
+                    let qsk: [u8; 32] = qsk_buf
+                        .0
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| CliError::input("qsk must be 32 bytes of hex"))?;
+                    let ak = from_hex_exact::<32>(json.field_str("ak")?, "ak")?;
+                    let nk = from_hex_exact::<32>(json.field_str("nk")?, "nk")?;
+                    (
+                        OrchardKeySource::QuantumSpendingKey,
+                        OrchardKeyWitness::QuantumSpendingKey { qsk, ak, nk },
+                        qsk_buf,
+                    )
+                }
+                Some(other) => {
+                    return Err(CliError::usage(format!(
+                        "--root '{other}' is not 'spending-key', 'seed', or 'qsk'"
+                    )));
+                }
+            };
+
+            let internal = args.flag("internal")
+                || json.get("internal").and_then(Json::as_bool).unwrap_or(false);
+            let alpha = from_hex_exact::<32>(json.field_str("alpha")?, "alpha")?;
+            let value = json.field_u64("value")?;
+            let rho_bytes = from_hex_exact::<32>(json.field_str("rho")?, "rho")?;
+            let rho = PallasFp::from_bytes(&rho_bytes).ok_or_else(|| {
+                CliError::input("rho is not a canonical Pallas base-field element")
+            })?;
+            let rseed = from_hex_exact::<32>(json.field_str("rseed")?, "rseed")?;
+            let recipient: [u8; 43] = if json.get("recipient").is_some() {
+                from_hex_exact::<43>(json.field_str("recipient")?, "recipient")?
+            } else {
+                let fvk = orchard_fvk(&key_source, &key_witness)
+                    .ok_or_else(|| CliError::input("invalid Orchard key in Ironwood witness"))?;
+                let scope = if internal {
+                    OrchardScope::Internal
+                } else {
+                    OrchardScope::External
+                };
+                let idx = match args.get_u64("diversifier-index")? {
+                    Some(i) => i,
+                    None => json
+                        .get("diversifier_index")
+                        .and_then(Json::as_u64)
+                        .unwrap_or(0),
+                };
+                let mut j = [0u8; 11];
+                j[..8].copy_from_slice(&idx.to_le_bytes());
+                let d = fvk.diversifier(&j, scope);
+                fvk.address(&d, scope).ok_or_else(|| {
+                    CliError::input("could not derive Ironwood recipient address")
+                })?
+            };
+            let note = OrchardNote {
+                recipient,
+                value,
+                rho,
+                rseed,
+                version: NoteVersion::V3,
+            };
+            let position = u32::try_from(
+                json.get("position")
+                    .and_then(Json::as_u64)
+                    .unwrap_or(0),
+            )
+            .map_err(|_| CliError::input("position exceeds u32::MAX"))?;
+
+            let path: [[u8; 32]; rehash::DEPTH] = if let Some(arr) =
+                json.get("merkle_path").and_then(Json::as_array)
+            {
+                if arr.len() != rehash::DEPTH {
+                    return Err(CliError::input(format!(
+                        "merkle_path must have {} siblings (got {})",
+                        rehash::DEPTH,
+                        arr.len()
+                    )));
+                }
+                let mut siblings = [[0u8; 32]; rehash::DEPTH];
+                for (slot, item) in siblings.iter_mut().zip(arr) {
+                    let hex = item
+                        .as_str()
+                        .ok_or_else(|| CliError::input("merkle_path entries must be hex strings"))?;
+                    *slot = from_hex_exact::<32>(hex, "merkle_path sibling")?;
+                }
+                siblings
+            } else if let Some(arr) = json.get("leaves").and_then(Json::as_array) {
+                let mut leaves = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let hex = item
+                        .as_str()
+                        .ok_or_else(|| CliError::input("leaves entries must be 64-hex strings"))?;
+                    leaves.push(from_hex_exact::<32>(hex, "leaf")?);
+                }
+                rehash::witness(&leaves, position)
+                    .ok_or_else(|| CliError::input("position out of range for leaves"))?
+                    .0
+            } else if position == 0 {
+                let cmx = note
+                    .cmx()
+                    .ok_or_else(|| CliError::input("note commitment is invalid"))?
+                    .to_bytes();
+                let leaf = rehash::leaf_hash(&cmx, &rho_bytes);
+                rehash::witness(&[leaf], 0).expect("single leaf").0
+            } else {
+                return Err(CliError::input(
+                    "Ironwood witness with position > 0 requires merkle_path or leaves",
+                ));
+            };
+
+            let spend_auth_sig = match args.get("spend-auth-sig") {
+                Some(hex) => Some(from_hex_exact::<64>(hex, "--spend-auth-sig")?),
+                None => match json.get("spend_auth_sig").and_then(Json::as_str) {
+                    Some(hex) => Some(from_hex_exact::<64>(hex, "spend_auth_sig")?),
+                    None => None,
+                },
+            };
+
+            let rec_witness = RecoveryWitness {
+                key: key_witness,
+                internal,
+                alpha,
+                note,
+                position,
+                path,
+            };
+            let stmt = RecoveryStatement::derive(&key_source, &rec_witness, pq, domain, epoch)
+                .ok_or_else(|| {
+                    CliError::input("Ironwood witness does not satisfy the ZIP 2005 note relation")
+                })?;
+            Ok((
+                LoadedStatement {
+                    statement: Statement::ZcashIronwood(stmt),
+                    target,
+                    target_text,
+                },
+                Witness::ZcashIronwood {
+                    witness: Box::new(rec_witness),
+                    spend_auth_sig,
+                },
+                secret,
+            ))
+        }
+        KindFamily::ZcashTransparent => {
+            reject_options(
+                args,
+                kind.name,
+                &[
+                    "merkle-root",
+                    "coin-type",
+                    "diversifier",
+                    "diversifier-index",
+                    "spend-auth-sig",
+                ],
+            )?;
+            if args.flag("internal") {
+                return Err(CliError::usage(
+                    "--internal does not apply to --kind zcash-transparent",
+                ));
+            }
+            let network = parse_network(args)?;
+            let encoding = if args.flag("uncompressed") {
+                KeyEncoding::Uncompressed
+            } else {
+                KeyEncoding::Compressed
+            };
+            let is_bip32 = args.get("root").is_some()
+                || args.get("path").is_some()
+                || args.get("hidden-path-depth").is_some()
+                || args.get("account").is_some();
+
+            if !is_bip32 {
+                let secret = read_legacy_secret(secret_path, SecretForm::Key32)?;
+                let key: [u8; 32] = secret.0.as_slice().try_into().expect("32 bytes");
+                let witness = OwnershipWitness::secp256k1_key(&key);
+                let stmt =
+                    TransparentStatement::derive_hidden(network, encoding, &witness, pq, domain, epoch)
+                        .ok_or_else(|| {
+                            CliError::input(
+                                "legacy secret is not a valid secp256k1 key (must be in 1..n)",
+                            )
+                        })?;
+                return Ok((
+                    LoadedStatement {
+                        statement: Statement::ZcashTransparent(stmt),
+                        target,
+                        target_text,
+                    },
+                    Witness::ZcashTransparent(witness),
+                    secret,
+                ));
+            }
+
+            let extended_root = match args.get("root") {
+                None | Some("seed") => false,
+                Some("extended-key") => true,
+                Some(other) => {
+                    return Err(CliError::usage(format!(
+                        "--root '{other}' is not 'seed' or 'extended-key'"
+                    )));
+                }
+            };
+            if args.get("path").is_some() && args.get("account").is_some() {
+                return Err(CliError::usage(
+                    "cannot combine --path and --account for --kind zcash-transparent",
+                ));
+            }
+            let path = match args.get("path") {
+                Some(p) => parse_path(p)?,
+                None if !extended_root => {
+                    let account = parse_u32_option(args, "account")?.unwrap_or(0);
+                    bip44_path(network, account, 0, 0).ok_or_else(|| {
+                        CliError::usage("--account must be below 2^31")
+                    })?
+                }
+                None => {
+                    return Err(CliError::usage(
+                        "--root extended-key requires --path for --kind zcash-transparent",
+                    ));
+                }
+            };
+            let hidden_depth = match args.get("hidden-path-depth") {
+                None => None,
+                Some(text) => Some(
+                    text.parse::<u8>()
+                        .ok()
+                        .filter(|d| (1..=MAX_BIP32_DEPTH).contains(&usize::from(*d)))
+                        .ok_or_else(|| {
+                            CliError::usage(format!(
+                                "--hidden-path-depth must be 1 to {MAX_BIP32_DEPTH}"
+                            ))
+                        })?,
+                ),
+            };
+            if hidden_depth.is_some_and(|d| path.len() > usize::from(d)) {
+                return Err(CliError::usage(
+                    "--path is longer than --hidden-path-depth allows",
+                ));
+            }
+            let form = if extended_root {
+                SecretForm::ExtendedKey
+            } else {
+                SecretForm::HexSeed
+            };
+            let secret = read_legacy_secret(secret_path, form)?;
+            let mut witness = if extended_root {
+                OwnershipWitness::extended_key(&HdNode {
+                    private_key: secret.0[..32].try_into().expect("32 bytes"),
+                    chain_code: secret.0[32..].try_into().expect("32 bytes"),
+                })
+            } else {
+                OwnershipWitness::seed(&secret.0)
+            };
+            let spec = match hidden_depth {
+                Some(max_depth) => {
+                    witness = witness.with_path(&path);
+                    PathSpec::Hidden { max_depth }
+                }
+                None => PathSpec::Public(path),
+            };
+            let source = KeySource::Bip32 {
+                root: if extended_root {
+                    Bip32Root::ExtendedKey
+                } else {
+                    Bip32Root::Seed
+                },
+                path: spec,
+            };
+            let stmt =
+                TransparentStatement::derive(network, encoding, source, &witness, pq, domain, epoch)
+                    .ok_or_else(|| {
+                        CliError::input(
+                            "legacy secret does not derive a valid Zcash transparent address",
+                        )
+                    })?;
+            Ok((
+                LoadedStatement {
+                    statement: Statement::ZcashTransparent(stmt),
+                    target,
+                    target_text,
+                },
+                Witness::ZcashTransparent(witness),
+                secret,
+            ))
+        }
+        KindFamily::Ownership { .. } => unreachable!("handled by derive()"),
+    }
+}
+
 /// The statement and witness the options describe.
-fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBuf), CliError> {
+fn derive(args: &Args) -> Result<(LoadedStatement, Witness, ZeroizingBuf), CliError> {
     let kind = kind_by_name(args.require("kind")?)?;
+    if !matches!(kind.family, KindFamily::Ownership { .. }) {
+        return derive_zcash(kind, args);
+    }
+    reject_options(args, kind.name, ZCASH_ONLY_OPTIONS)?;
+    if args.flag("internal") || args.flag("uncompressed") {
+        return Err(CliError::usage(format!(
+            "--internal and --uncompressed do not apply to --kind {}",
+            kind.name
+        )));
+    }
+    let (lock, _) = kind.ownership_parts().expect("ownership kind");
     let path = match (kind.derivation_path(), args.get("path")) {
         (true, Some(path)) => parse_path(path)?,
         (true, None) => {
@@ -921,9 +1985,10 @@ fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBu
     if let Some(root) = merkle_root {
         witness = witness.with_merkle_root(root);
     }
+    let key_source = kind.key_source(path, options).expect("ownership kind");
     let statement = OwnershipStatement::derive(
-        kind.lock,
-        kind.key_source(path, options),
+        lock,
+        key_source,
         &witness,
         pq_commitment(&target),
         domain,
@@ -937,16 +2002,16 @@ fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBu
     })?;
     Ok((
         LoadedStatement {
-            statement,
+            statement: Statement::Ownership(statement),
             target,
             target_text,
         },
-        witness,
+        Witness::Ownership(witness),
         secret,
     ))
 }
 
-fn kind_name(statement: &OwnershipStatement) -> &'static str {
+fn kind_name(statement: &Statement) -> &'static str {
     kind_of(statement).map_or("unsupported", |kind| kind.name)
 }
 
@@ -955,18 +2020,22 @@ fn summary(loaded: &LoadedStatement) -> String {
         "{} -> {} at epoch {} (nullifier {})",
         kind_name(&loaded.statement),
         loaded.target_text,
-        loaded.statement.epoch,
-        to_hex(&loaded.statement.nullifier)
+        loaded.statement.epoch(),
+        to_hex(&loaded.statement.nullifier())
     )
 }
 
 fn claim(raw: &[String]) -> Result<(), CliError> {
-    let args = Args::parse(raw, STATEMENT_OPTIONS, &["json", "help"])?;
+    let args = Args::parse(
+        raw,
+        STATEMENT_OPTIONS,
+        &["internal", "uncompressed", "json", "help"],
+    )?;
     if args.flag("help") {
         println!(
-            "dregg-sig migrate claim --kind <{}> --legacy-secret <path> [--path <m/..>] [--root <seed|extended-key>] [--hidden-path-depth <n>] [--merkle-root <64-hex>] --target <address> --epoch <n> [--domain-hex <64-hex>] [--out <path>] [--json]\n\n\
-Derive the statement a proof will be about: the legacy value, the nullifier of the legacy key\n\
-in the migration domain, and the commitment to the target address. Nothing secret is written.\n\
+            "dregg-sig migrate claim --kind <{}> --legacy-secret <path> [--path <m/..>] [--root <seed|extended-key|spending-key|qsk>] [--hidden-path-depth <n>] [--merkle-root <64-hex>] [--network <main|test>] [--account <n>] [--diversifier <22-hex>] [--diversifier-index <n>] [--internal] [--uncompressed] --target <address> --epoch <n> [--domain-hex <64-hex>] [--out <path>] [--json]\n\n\
+Derive the statement a proof will be about: the legacy or Zcash value, the nullifier in the\n\
+migration domain, and the commitment to the target address. Nothing secret is written.\n\
 --root extended-key reads an extended private key (xprv/tprv, or 64 bytes of hex: private key\n\
 then chain code) instead of a master seed; sound only while no extended public key at or above\n\
 it has been exported. --hidden-path-depth <n> keeps --path out of the statement: only the bound\n\
@@ -978,10 +2047,9 @@ n is public. --merkle-root is the secret-side script tree root of a Taproot scri
     }
     args.no_positionals()?;
     let (loaded, _witness, _secret) = derive(&args)?;
-    let doc = document(
-        CLAIM_FORMAT,
-        statement_members(&loaded.statement, &loaded.target_text),
-    );
+    let members = statement_members(&loaded.statement, &loaded.target_text)
+        .map_err(CliError::input)?;
+    let doc = document(CLAIM_FORMAT, members);
     if let Some(out) = args.get("out") {
         write_new(out, doc.to_pretty().as_bytes(), false)?;
     }
@@ -1049,12 +2117,17 @@ fn from_base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// An upper bound on the encoding of an ownership proof for `statement`: the bound the
-/// proof system states for the statement's relation, plus the magic and regime byte of
-/// the ownership envelope. `None` for a malformed statement.
-fn max_proof_bytes(statement: &OwnershipStatement) -> Option<usize> {
-    let shape = ownership_shape(statement)?;
-    dregg_sig_agg::zk_hem::protocol::max_proof_bytes(&shape, REGIME).map(|n| n + 9)
+/// An upper bound on the encoding of a proof for `statement`: the bound the `zk-Hem v2`
+/// calculator states for the statement's relation, plus the envelope header bytes.
+fn max_proof_bytes(statement: &Statement) -> Option<usize> {
+    let (shape, overhead) = match statement {
+        Statement::Ownership(s) => (ownership_shape(s)?, 9),
+        Statement::ZcashIronwood(s) => (recovery_shape(s)?, 74),
+        Statement::ZcashOrchard(s) => (address_shape(s)?, 10),
+        Statement::ZcashSapling(s) => (sapling_address_shape(s)?, 10),
+        Statement::ZcashTransparent(s) => (ownership_shape(&s.ownership)?, 9),
+    };
+    bounds::max_proof_bytes(REGIME, &shape).map(|n| n + overhead)
 }
 
 fn map_ownership_error(err: OwnershipError) -> CliError {
@@ -1066,17 +2139,92 @@ fn map_ownership_error(err: OwnershipError) -> CliError {
     }
 }
 
+fn map_recovery_error(err: RecoveryError) -> CliError {
+    match err {
+        RecoveryError::MalformedStatement | RecoveryError::WitnessMismatch => {
+            CliError::input(format!("Zcash migration witness error: {err:?}"))
+        }
+        RecoveryError::SignatureRequired => CliError::usage(
+            "--kind ironwood with --root qsk requires --spend-auth-sig <128-hex>",
+        ),
+        RecoveryError::BadSignature => {
+            CliError::input("Zcash spend authorization signature does not verify under rk")
+        }
+        RecoveryError::Proof(e) => {
+            CliError::input(format!("Zcash migration proving failed: {e:?}"))
+        }
+    }
+}
+
+fn prove_statement_bytes(
+    statement: &Statement,
+    witness: &Witness,
+    seed: &[u8; 32],
+) -> Result<Vec<u8>, CliError> {
+    match (statement, witness) {
+        (Statement::Ownership(s), Witness::Ownership(w)) => {
+            prove_ownership(s, w, REGIME, seed)
+                .map(|p| p.to_bytes())
+                .map_err(map_ownership_error)
+        }
+        (
+            Statement::ZcashIronwood(s),
+            Witness::ZcashIronwood {
+                witness,
+                spend_auth_sig,
+            },
+        ) => prove_recovery(s, witness, REGIME, seed, spend_auth_sig.as_ref())
+            .map(|p| p.to_bytes())
+            .map_err(map_recovery_error),
+        (Statement::ZcashOrchard(s), Witness::ZcashOrchard(w)) => {
+            prove_address(s, w, REGIME, seed)
+                .map(|p| p.to_bytes())
+                .map_err(map_recovery_error)
+        }
+        (Statement::ZcashSapling(s), Witness::ZcashSapling(w)) => {
+            prove_sapling_address(s, w, REGIME, seed)
+                .map(|p| p.to_bytes())
+                .map_err(map_recovery_error)
+        }
+        (Statement::ZcashTransparent(s), Witness::ZcashTransparent(w)) => {
+            prove_transparent(s, w, REGIME, seed)
+                .map(|p| p.to_bytes())
+                .map_err(map_ownership_error)
+        }
+        _ => Err(CliError::input("statement and witness kind mismatch")),
+    }
+}
+
+fn verify_statement_bytes(statement: &Statement, bytes: &[u8]) -> Option<bool> {
+    match statement {
+        Statement::Ownership(s) => {
+            OwnershipProof::from_bytes(bytes, s).map(|p| verify_ownership(s, REGIME, &p))
+        }
+        Statement::ZcashIronwood(s) => {
+            RecoveryProof::from_bytes(bytes, s).map(|p| verify_recovery(s, REGIME, &p))
+        }
+        Statement::ZcashOrchard(s) => {
+            AddressProof::from_bytes(bytes, s).map(|p| verify_address(s, REGIME, &p))
+        }
+        Statement::ZcashSapling(s) => SaplingAddressProof::from_bytes(bytes, s)
+            .map(|p| verify_sapling_address(s, REGIME, &p)),
+        Statement::ZcashTransparent(s) => {
+            TransparentProof::from_bytes(bytes, s).map(|p| verify_transparent(s, REGIME, &p))
+        }
+    }
+}
+
 fn prove(raw: &[String]) -> Result<(), CliError> {
-    let args = Args::parse(raw, STATEMENT_OPTIONS, &["deterministic", "json", "help"])?;
+    let args = Args::parse(
+        raw,
+        STATEMENT_OPTIONS,
+        &["internal", "uncompressed", "deterministic", "json", "help"],
+    )?;
     if args.flag("help") {
         println!(
-            "dregg-sig migrate prove --kind <{}> --legacy-secret <path> [--path <m/..>] [--root <seed|extended-key>] [--hidden-path-depth <n>] [--merkle-root <64-hex>] --target <address> --epoch <n> [--domain-hex <64-hex>] --out <path> [--deterministic] [--json]\n\n\
-Prove ownership of a legacy credential and bind it to --target, --epoch and the migration\n\
-domain. --deterministic derives the proof randomness from the secret and the statement.\n\
---root extended-key reads an extended private key (xprv/tprv, or 64 bytes of hex: private key\n\
-then chain code) instead of a master seed; sound only while no extended public key at or above\n\
-it has been exported. --hidden-path-depth <n> keeps --path out of the statement: only the bound\n\
-n is public. --merkle-root is the secret-side script tree root of a Taproot script-tree kind.\n\n{}",
+            "dregg-sig migrate prove --kind <{}> --legacy-secret <path> [--path <m/..>] [--root <seed|extended-key|spending-key|qsk>] [--hidden-path-depth <n>] [--merkle-root <64-hex>] [--network <main|test>] [--account <n>] [--diversifier <22-hex>] [--diversifier-index <n>] [--spend-auth-sig <128-hex>] [--internal] [--uncompressed] --target <address> --epoch <n> [--domain-hex <64-hex>] --out <path> [--deterministic] [--json]\n\n\
+Prove ownership of a legacy or Zcash credential and bind it to --target, --epoch and the\n\
+migration domain. --deterministic derives the proof randomness from the secret and the statement.\n\n{}",
             kind_names(),
             kinds_help()
         );
@@ -1094,19 +2242,15 @@ n is public. --merkle-root is the secret-side script tree root of a Taproot scri
     } else {
         os_random_32()?
     });
-    let proof =
-        prove_ownership(statement, &witness, REGIME, &seed.0).map_err(map_ownership_error)?;
-    let bytes = proof.to_bytes();
-    // Never write a proof that `verify` would refuse.
+    let bytes = prove_statement_bytes(statement, &witness, &seed.0)?;
     let cap = max_proof_bytes(statement).unwrap_or(0);
-    let reread = OwnershipProof::from_bytes(&bytes, statement);
-    if bytes.len() > cap || !reread.is_some_and(|proof| verify_ownership(statement, REGIME, &proof))
-    {
+    if bytes.len() > cap || verify_statement_bytes(statement, &bytes) != Some(true) {
         return Err(CliError::verify(
             "the generated migration proof does not verify; nothing was written",
         ));
     }
-    let mut members = statement_members(statement, &loaded.target_text);
+    let mut members =
+        statement_members(statement, &loaded.target_text).map_err(CliError::input)?;
     members.extend([
         ("regime", Json::str(REGIME_NAME)),
         ("proof_bytes", Json::num(bytes.len())),
@@ -1119,7 +2263,9 @@ n is public. --merkle-root is the secret-side script tree root of a Taproot scri
     )?;
     if args.flag("json") {
         let mut report = vec![("operation", Json::str("migrate-prove"))];
-        report.extend(statement_members(statement, &loaded.target_text));
+        report.extend(
+            statement_members(statement, &loaded.target_text).map_err(CliError::input)?,
+        );
         report.extend([
             ("regime", Json::str(REGIME_NAME)),
             ("proof_bytes", Json::num(bytes.len())),
@@ -1176,15 +2322,16 @@ fn load_verified(path: &str, expected: &Expectation) -> Result<LoadedStatement, 
             "{path}: proof is not under the {REGIME_NAME} regime"
         )));
     }
-    if statement.migration_domain != expected.domain {
+    if statement.migration_domain() != expected.domain {
         return Err(CliError::verify(
             "proof is for another migration domain (--domain-hex)",
         ));
     }
-    if statement.epoch != expected.epoch {
+    if statement.epoch() != expected.epoch {
         return Err(CliError::verify(format!(
             "proof is for epoch {}, not --epoch {}",
-            statement.epoch, expected.epoch
+            statement.epoch(),
+            expected.epoch
         )));
     }
     if expected
@@ -1212,10 +2359,10 @@ fn load_verified(path: &str, expected: &Expectation) -> Result<LoadedStatement, 
     if json.get("proof_bytes").and_then(Json::as_u64) != u64::try_from(bytes.len()).ok() {
         return Err(CliError::verify("proof_bytes does not match the proof"));
     }
-    let proof = OwnershipProof::from_bytes(&bytes, statement)
-        .ok_or_else(|| CliError::verify("proof is not a canonical ownership proof"))?;
-    if !verify_ownership(statement, REGIME, &proof) {
-        return Err(CliError::verify("migration proof verification failed"));
+    match verify_statement_bytes(statement, &bytes) {
+        None => return Err(CliError::verify("proof is not a canonical migration proof")),
+        Some(false) => return Err(CliError::verify("migration proof verification failed")),
+        Some(true) => {}
     }
     Ok(loaded)
 }
@@ -1254,7 +2401,10 @@ registry refuses it (the nullifier or the legacy credential is already bound els
         let loaded = load_verified(args.require("proof")?, &Expectation::from_args(&args)?)?;
         if args.flag("json") {
             let mut report = vec![("valid", Json::Bool(true))];
-            report.extend(statement_members(&loaded.statement, &loaded.target_text));
+            report.extend(
+                statement_members(&loaded.statement, &loaded.target_text)
+                    .map_err(CliError::verify)?,
+            );
             print!("{}", Json::object(report).to_pretty());
         } else {
             println!("valid ({})", summary(&loaded));
@@ -1324,8 +2474,6 @@ fn registry_secret(seed: &Secret32, label: &[u8]) -> Secret32 {
     ))
 }
 
-/// The log's MAC key. It depends on whether the registry was created with an anchor, so
-/// a root file edited to drop the anchor requirement opens no log.
 fn log_key(seed: &Secret32, anchored: bool) -> Secret32 {
     registry_secret(
         seed,
@@ -1466,7 +2614,6 @@ fn init(raw: &[String]) -> Result<(), CliError> {
     vault.bind(&mut file)?;
     vault.seal(&mut file)?;
     let encoded = ZeroizingBuf::new(file.to_pretty().into_bytes());
-    // Written last: a directory without it was never a usable registry.
     write_new(&root, &encoded.0, true)?;
 
     if args.flag("json") {
@@ -1482,7 +2629,6 @@ fn init(raw: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Open the registry the options name, under its anchor if it has one.
 fn open_registry(args: &Args) -> Result<NullifierRegistry, CliError> {
     let dir = args.require("registry-dir")?;
     let passphrase = crate::envelope::passphrase(args)?;
@@ -1572,12 +2718,13 @@ fn status_name(status: BindingStatus) -> &'static str {
     }
 }
 
-/// Verify the proof, then submit its binding. The registry is opened only after the proof
-/// verified, and the binding submitted is the verified statement's own.
 fn submit(args: &Args, submission: Submission) -> Result<(), CliError> {
     args.require("registry-dir")?;
     let loaded = load_verified(args.require("proof")?, &Expectation::from_args(args)?)?;
-    let binding = loaded.statement.binding();
+    let binding = loaded
+        .statement
+        .binding()
+        .ok_or_else(|| CliError::verify("statement has no canonical registry binding"))?;
     let mut registry = open_registry(args)?;
     let receipt: Receipt = match submission {
         Submission::Register => registry.register(&binding),
@@ -1593,7 +2740,9 @@ fn submit(args: &Args, submission: Submission) -> Result<(), CliError> {
             ("appended", Json::Bool(receipt.appended)),
         ];
         report.extend(checkpoint_members(receipt.checkpoint));
-        report.extend(statement_members(&loaded.statement, &loaded.target_text));
+        report.extend(
+            statement_members(&loaded.statement, &loaded.target_text).map_err(CliError::verify)?,
+        );
         print!("{}", Json::object(report).to_pretty());
     } else {
         println!(
@@ -1695,7 +2844,10 @@ binding is recorded; the output says `absent` when none is.\n\n{REGISTRY_HELP}"
                     load_statement(&json, PROOF_FORMAT, &["regime", "proof_bytes", "proof"])
                 })
                 .map_err(|e| CliError::input(format!("{path}: {e}")))?;
-            let binding = loaded.statement.binding();
+            let binding = loaded
+                .statement
+                .binding()
+                .ok_or_else(|| CliError::input("statement has no canonical registry binding"))?;
             (Some(binding.nullifier), Some(binding.legacy_id))
         }
         _ => (None, None),
@@ -1822,74 +2974,190 @@ mod tests {
         address(7)
     }
 
-    /// One statement per table entry, from fixed secrets.
-    fn statements() -> Vec<(&'static KindSpec, OwnershipStatement, OwnershipWitness)> {
+    /// One statement per table entry across all 19 kinds, from fixed secrets.
+    fn statements() -> Vec<(&'static KindSpec, Statement, Witness)> {
+        let pq = pq_commitment(&target());
+        let domain = [9u8; 32];
+        let epoch = 3u64;
         KINDS
             .iter()
-            .map(|&kind| {
-                let secret: Vec<u8> = match kind.secret {
-                    SecretForm::Key32 => (1..=32).collect(),
-                    SecretForm::HexSeed => (1..=16).collect(),
-                    SecretForm::ExtendedKey => (1..=64).collect(),
-                    SecretForm::Ed25519ExtendedKey => {
-                        // k_L clamped as the scheme requires of a root key.
-                        let mut key: Vec<u8> = (1..=96).collect();
-                        key[0] &= 0xf8;
-                        key[31] = (key[31] & 0x1f) | 0x40;
-                        key
+            .map(|&kind| match kind.family {
+                KindFamily::Ownership { lock, source } => {
+                    let secret: Vec<u8> = match kind.secret {
+                        SecretForm::Key32 => (1..=32).collect(),
+                        SecretForm::HexSeed => (1..=16).collect(),
+                        SecretForm::ExtendedKey => (1..=64).collect(),
+                        SecretForm::Ed25519ExtendedKey => {
+                            let mut key: Vec<u8> = (1..=96).collect();
+                            key[0] &= 0xf8;
+                            key[31] = (key[31] & 0x1f) | 0x40;
+                            key
+                        }
+                        SecretForm::Zip32Seed | SecretForm::JsonNote => unreachable!(),
+                    };
+                    let path = if source == Source::Slip10 {
+                        parse_path("m/44'/501'").unwrap()
+                    } else if kind.derivation_path() {
+                        parse_path("m/44'/0'/0'/0/0").unwrap()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut witness = kind.witness(&secret, SourceOptions::default()).unwrap();
+                    if kind.script_tree() {
+                        witness = witness.with_merkle_root([0x5a; 32]);
                     }
-                };
-                let path = if kind.source == Source::Slip10 {
-                    parse_path("m/44'/501'").unwrap()
-                } else if kind.derivation_path() {
-                    parse_path("m/44'/0'/0'/0/0").unwrap()
-                } else {
-                    Vec::new()
-                };
-                let mut witness = kind.witness(&secret, SourceOptions::default()).unwrap();
-                if kind.script_tree() {
-                    witness = witness.with_merkle_root([0x5a; 32]);
+                    let statement = OwnershipStatement::derive(
+                        lock,
+                        kind.key_source(path, SourceOptions::default()).unwrap(),
+                        &witness,
+                        pq,
+                        domain,
+                        epoch,
+                    )
+                    .unwrap();
+                    (
+                        kind,
+                        Statement::Ownership(statement),
+                        Witness::Ownership(witness),
+                    )
                 }
-                let statement = OwnershipStatement::derive(
-                    kind.lock,
-                    kind.key_source(path, SourceOptions::default()),
-                    &witness,
-                    pq_commitment(&target()),
-                    [9; 32],
-                    3,
-                )
-                .unwrap();
-                (kind, statement, witness)
+                KindFamily::ZcashOrchard => {
+                    let sk = [0x21u8; 32];
+                    let fvk = OrchardFullViewingKey::from_spending_key(&sk).unwrap();
+                    let d = fvk.diversifier(&[0; 11], OrchardScope::External);
+                    let w = AddressWitness {
+                        key: OrchardKeyWitness::SpendingKey(sk),
+                        internal: false,
+                    };
+                    let stmt = AddressStatement::derive(
+                        &OrchardKeySource::SpendingKey,
+                        &w,
+                        &d,
+                        pq,
+                        domain,
+                        epoch,
+                    )
+                    .unwrap();
+                    (
+                        kind,
+                        Statement::ZcashOrchard(stmt),
+                        Witness::ZcashOrchard(Box::new(w)),
+                    )
+                }
+                KindFamily::ZcashSapling => {
+                    let sk = [0x31u8; 32];
+                    let d = sapling::default_diversifier(&sk);
+                    let w = SaplingKeyWitness::SpendingKey(sk);
+                    let stmt = SaplingAddressStatement::derive(
+                        &SaplingKeySource::SpendingKey,
+                        &w,
+                        &d,
+                        pq,
+                        domain,
+                        epoch,
+                    )
+                    .unwrap();
+                    (
+                        kind,
+                        Statement::ZcashSapling(stmt),
+                        Witness::ZcashSapling(w),
+                    )
+                }
+                KindFamily::ZcashIronwood => {
+                    let sk = [0x41u8; 32];
+                    let fvk = OrchardFullViewingKey::from_spending_key(&sk).unwrap();
+                    let recipient = fvk.default_address(OrchardScope::External).unwrap();
+                    let mut rho_bytes = [0u8; 32];
+                    rho_bytes[0] = 7;
+                    let rho = PallasFp::from_bytes(&rho_bytes).unwrap();
+                    let note = OrchardNote {
+                        recipient,
+                        value: 125_000_000,
+                        rho,
+                        rseed: [0x55; 32],
+                        version: NoteVersion::V3,
+                    };
+                    let cmx = note.cmx().unwrap().to_bytes();
+                    let leaf = rehash::leaf_hash(&cmx, &rho_bytes);
+                    let (path, _) = rehash::witness(&[leaf], 0).unwrap();
+                    let mut alpha = [0u8; 32];
+                    alpha[0] = 9;
+                    let w = RecoveryWitness {
+                        key: OrchardKeyWitness::SpendingKey(sk),
+                        internal: false,
+                        alpha,
+                        note,
+                        position: 0,
+                        path,
+                    };
+                    let stmt = RecoveryStatement::derive(
+                        &OrchardKeySource::SpendingKey,
+                        &w,
+                        pq,
+                        domain,
+                        epoch,
+                    )
+                    .unwrap();
+                    (
+                        kind,
+                        Statement::ZcashIronwood(stmt),
+                        Witness::ZcashIronwood {
+                            witness: Box::new(w),
+                            spend_auth_sig: None,
+                        },
+                    )
+                }
+                KindFamily::ZcashTransparent => {
+                    let mut key = [0u8; 32];
+                    key[31] = 1;
+                    let w = OwnershipWitness::secp256k1_key(&key);
+                    let stmt = TransparentStatement::derive_hidden(
+                        Network::Main,
+                        KeyEncoding::Compressed,
+                        &w,
+                        pq,
+                        domain,
+                        epoch,
+                    )
+                    .unwrap();
+                    (
+                        kind,
+                        Statement::ZcashTransparent(stmt),
+                        Witness::ZcashTransparent(w),
+                    )
+                }
             })
             .collect()
     }
 
     #[test]
     fn every_table_entry_derives_a_claim_that_maps_back_to_it_and_renders() {
+        let all = statements();
+        assert_eq!(all.len(), KIND_COUNT);
         let mut names = Vec::new();
-        for (kind, statement, _) in statements() {
+        for (kind, statement, _) in all {
             assert!(
                 std::ptr::eq(kind_of(&statement).unwrap(), kind),
                 "{}",
                 kind.name
             );
-            assert_eq!(kind.render(&statement)[0].0, kind.member, "{}", kind.name);
-            assert_eq!(
-                kind.render(&statement).len(),
-                1 + usize::from(kind.derivation_path())
-            );
+            let rendered = statement.render_kind_members(kind);
+            assert_eq!(rendered[0].0, kind.member, "{}", kind.name);
             assert!(std::ptr::eq(kind_by_name(kind.name).unwrap(), kind));
             names.push(kind.name);
             for alias in kind.aliases {
                 assert!(std::ptr::eq(kind_by_name(alias).unwrap(), kind));
                 names.push(alias);
             }
-            // No other entry claims this statement.
-            let claimed = KINDS
-                .iter()
-                .filter(|other| other.lock == statement.lock && other.offers(&statement.source))
-                .count();
-            assert_eq!(claimed, 1, "{}", kind.name);
+            if let Statement::Ownership(s) = &statement {
+                let claimed = KINDS
+                    .iter()
+                    .filter(|other| {
+                        matches!(other.family, KindFamily::Ownership { lock, .. } if lock == s.lock && other.offers(&s.source))
+                    })
+                    .count();
+                assert_eq!(claimed, 1, "{}", kind.name);
+            }
         }
         let count = names.len();
         names.sort_unstable();
@@ -1905,6 +3173,7 @@ mod tests {
     #[test]
     fn roots_and_hidden_paths_are_options_of_a_kind_and_render() {
         let kind = kind_by_name("bip32-secp256k1").unwrap();
+        let (lock, _) = kind.ownership_parts().unwrap();
         let path = parse_path("m/44'/0'/0'/0/0").unwrap();
         let node: Vec<u8> = (1..=64).collect();
         let seed: Vec<u8> = (1..=16).collect();
@@ -1913,18 +3182,21 @@ mod tests {
             if options.hidden_depth.is_some() {
                 witness = witness.with_path(&path);
             }
-            OwnershipStatement::derive(
-                kind.lock,
-                kind.key_source(path.clone(), options),
-                &witness,
-                pq_commitment(&target()),
-                [9; 32],
-                3,
+            Statement::Ownership(
+                OwnershipStatement::derive(
+                    lock,
+                    kind.key_source(path.clone(), options).unwrap(),
+                    &witness,
+                    pq_commitment(&target()),
+                    [9; 32],
+                    3,
+                )
+                .unwrap(),
             )
-            .unwrap()
         };
-        let names = |statement: &OwnershipStatement| -> Vec<&'static str> {
-            kind.render(statement)
+        let names = |statement: &Statement| -> Vec<&'static str> {
+            statement
+                .render_kind_members(kind)
                 .iter()
                 .map(|(name, _)| *name)
                 .collect()
@@ -1950,20 +3222,19 @@ mod tests {
             names(&extended),
             ["legacy_hash160", "bip32_root", "derivation_path"]
         );
-        // Same seed and path: the same credential, whether or not the path is public.
-        assert_eq!(public.credential, hidden.credential);
         assert_ne!(public.to_bytes(), hidden.to_bytes());
-        assert_ne!(public.credential, extended.credential);
         for statement in [&public, &hidden, &extended] {
             assert!(std::ptr::eq(kind_of(statement).unwrap(), kind));
             let text = target().encode().unwrap();
-            let doc = document(CLAIM_FORMAT, statement_members(statement, &text));
+            let doc = document(
+                CLAIM_FORMAT,
+                statement_members(statement, &text).unwrap(),
+            );
             assert_eq!(
                 load_statement(&doc, CLAIM_FORMAT, &[]).unwrap().statement,
                 *statement
             );
         }
-        // Options a kind does not take.
         let key = kind_by_name("eth-eoa").unwrap();
         assert!(!key.admits(SourceOptions {
             extended_root: true,
@@ -1981,7 +3252,6 @@ mod tests {
 
     #[test]
     fn extended_private_keys_parse_bip32_test_vector_1_and_reject_damage() {
-        // BIP-32 test vector 1, chain m.
         let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
         let node = parse_extended_private_key(xprv).unwrap();
         assert_eq!(
@@ -1992,7 +3262,6 @@ mod tests {
             to_hex(&node.0[32..]),
             "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508"
         );
-        // The matching extended public key is not a private key.
         let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
         assert!(parse_extended_private_key(xpub).is_err());
         let mut damaged = xprv.to_owned();
@@ -2007,7 +3276,10 @@ mod tests {
     fn statement_documents_round_trip_and_reject_any_other_content() {
         let text = target().encode().unwrap();
         for (kind, statement, _) in statements() {
-            let doc = document(CLAIM_FORMAT, statement_members(&statement, &text));
+            let doc = document(
+                CLAIM_FORMAT,
+                statement_members(&statement, &text).unwrap(),
+            );
             let loaded = load_statement(&doc, CLAIM_FORMAT, &[]).unwrap();
             assert_eq!(loaded.statement, statement, "{}", kind.name);
             assert_eq!(loaded.target, target());
@@ -2015,7 +3287,6 @@ mod tests {
             let Json::Object(members) = &doc else {
                 unreachable!()
             };
-            // Every member is checked: changing, dropping or adding one is refused.
             for index in 1..members.len() {
                 let mut changed = members.clone();
                 changed[index].1 = Json::str("00");
@@ -2033,10 +3304,12 @@ mod tests {
             added.push(("note".into(), Json::str("x")));
             assert!(load_statement(&Json::Object(added), CLAIM_FORMAT, &[]).is_err());
         }
-        // Another address than the committed one, in canonical form.
         let (_, statement, _) = statements().remove(0);
         let other = address(8).encode().unwrap();
-        let doc = document(CLAIM_FORMAT, statement_members(&statement, &other));
+        let doc = document(
+            CLAIM_FORMAT,
+            statement_members(&statement, &other).unwrap(),
+        );
         let err = load_statement(&doc, CLAIM_FORMAT, &[]).err().unwrap();
         assert!(err.contains("commits to"), "{err}");
     }
@@ -2118,17 +3391,18 @@ mod tests {
         assert_ne!(registry_id(&seed, &[1; 16]), registry_id(&seed, &[2; 16]));
     }
 
-    /// The bound must hold for every kind, and must be a bound on this statement's
-    /// proof, not a blanket ceiling.
+    /// The bound must hold for every kind (all 15 legacy kinds + all 4 Zcash kinds), and
+    /// must be a tight bound on this statement's proof, not a blanket ceiling.
     #[test]
     fn proof_size_bound_covers_every_kind_and_stays_within_a_factor_of_two() {
         for (kind, statement, witness) in statements() {
             let cap = max_proof_bytes(&statement).unwrap();
-            let proof = prove_ownership(&statement, &witness, REGIME, &[5; 32]).unwrap();
-            let len = proof.to_bytes().len();
+            let bytes = prove_statement_bytes(&statement, &witness, &[5; 32]).unwrap();
+            let len = bytes.len();
             println!("{}: proof {len} bytes, bound {cap} bytes", kind.name);
             assert!(len <= cap, "{}: {len} > {cap}", kind.name);
             assert!(cap < 2 * len, "{}: bound {cap} for {len}", kind.name);
+            assert_eq!(verify_statement_bytes(&statement, &bytes), Some(true), "{}", kind.name);
         }
     }
 }

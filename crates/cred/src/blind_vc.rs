@@ -121,21 +121,11 @@ const VC_MERKLE_NODE_TAG: u64 = 0x5643_4D4B_4C45_5631; // "VCMKLEV1"
 /// Errors returned by `PiBlindVc` issuance, accumulator enrollment, or selective disclosure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlindVcError {
-    AttributeCountExceeded {
-        count: usize,
-    },
-    NonCanonicalGoldilocksAttribute {
-        index: usize,
-    },
-    InvalidDisclosedAttributeIndex {
-        index: usize,
-    },
-    DuplicateDisclosedAttributeIndex {
-        index: usize,
-    },
-    DisclosedAttributeValueMismatch {
-        index: usize,
-    },
+    AttributeCountExceeded { count: usize },
+    NonCanonicalGoldilocksAttribute { index: usize },
+    InvalidDisclosedAttributeIndex { index: usize },
+    DuplicateDisclosedAttributeIndex { index: usize },
+    DisclosedAttributeValueMismatch { index: usize },
     BlindIssuanceProofInvalid,
     InvalidOprfEvaluation,
     AccumulatorFull,

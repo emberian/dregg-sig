@@ -24,13 +24,14 @@
 //! with the `orchard` crate in `validation/zcash`.
 
 use alloc::vec::Vec;
+use dregg_sig_core::wipe::{SecretBuffer, SecretScratch};
 
 use super::blake2::{Blake2b, blake2b_256, blake2b_512};
 use super::blake3;
 use super::ff1::ff1_aes256_encrypt_88;
 use super::pallas::{Fp, Fq, Point, hash_to_curve};
 use super::poseidon;
-use super::sinsemilla::{CommitDomain, HashDomain, le_bits};
+use super::sinsemilla::{CommitDomain, HashDomain};
 
 /// Depth of the note commitment tree.
 pub const MERKLE_DEPTH: usize = 32;
@@ -137,10 +138,15 @@ pub fn h_rivk_int(rivk_ext: &Fq, ak: &Fp, nk: &Fp) -> Fq {
     ))
 }
 
+fn append_bits(bits: &mut SecretScratch<bool>, bytes: &[u8], count: usize) {
+    bits.extend((0..count).map(|i| (bytes[i / 8] >> (i % 8)) & 1 != 0));
+}
+
 /// `Commit^ivk_rivk(ak, nk)`: `None` when the commitment is `⊥` or zero.
 pub fn commit_ivk(ak: &Fp, nk: &Fp, rivk: &Fq) -> Option<Fp> {
-    let mut bits = le_bits(&ak.to_bytes(), 255);
-    bits.extend(le_bits(&nk.to_bytes(), 255));
+    let mut bits = SecretScratch::new();
+    append_bits(&mut bits, &ak.to_bytes(), 255);
+    append_bits(&mut bits, &nk.to_bytes(), 255);
     commit_ivk_domain()
         .short_commit(&bits, rivk)
         .filter(|ivk| !ivk.is_zero())
@@ -205,7 +211,7 @@ impl FullViewingKey {
     pub fn from_qsk(sk: &[u8; 32], ak: &Fp) -> Option<Self> {
         let nk = h_nk(sk);
         let mut qsk = h_qsk(sk);
-        let qk = h_qk(&qsk);
+        let qk = SecretBuffer(h_qk(&qsk));
         wipe(&mut qsk);
         Self {
             ak: *ak,
@@ -260,10 +266,10 @@ impl FullViewingKey {
 
     /// `(dk, ovk)` of a scope: `PRF^expand_rivk([0x82] || ak || nk)` split in halves.
     pub fn dk_ovk(&self, scope: Scope) -> ([u8; 32], [u8; 32]) {
-        let wide = prf_expand(
+        let wide = SecretBuffer(prf_expand(
             &self.rivk(scope).to_bytes(),
             &[&[0x82], &self.ak.to_bytes(), &self.nk.to_bytes()],
-        );
+        ));
         (
             wide[..32].try_into().unwrap(),
             wide[32..].try_into().unwrap(),
@@ -272,7 +278,8 @@ impl FullViewingKey {
 
     /// The diversifier at an index: `FF1-AES256_dk("", I2LEBSP_88(index))`.
     pub fn diversifier(&self, index: &[u8; 11], scope: Scope) -> [u8; 11] {
-        ff1_aes256_encrypt_88(&self.dk_ovk(scope).0, index)
+        let keys = SecretBuffer(self.dk_ovk(scope));
+        ff1_aes256_encrypt_88(&keys.0.0, index)
     }
 
     /// The raw address `d || pk_d` for a diversifier.
@@ -366,11 +373,12 @@ pub fn note_commitment(
     psi: &Fp,
     rcm: &Fq,
 ) -> Option<Point> {
-    let mut bits = le_bits(g_d, 256);
-    bits.extend(le_bits(pk_d, 256));
-    bits.extend(le_bits(&value.to_le_bytes(), 64));
-    bits.extend(le_bits(&rho.to_bytes(), 255));
-    bits.extend(le_bits(&psi.to_bytes(), 255));
+    let mut bits = SecretScratch::new();
+    append_bits(&mut bits, g_d, 256);
+    append_bits(&mut bits, pk_d, 256);
+    append_bits(&mut bits, &value.to_le_bytes(), 64);
+    append_bits(&mut bits, &rho.to_bytes(), 255);
+    append_bits(&mut bits, &psi.to_bytes(), 255);
     note_commit_domain().commit(&bits, rcm)
 }
 
@@ -459,9 +467,10 @@ impl Note {
 /// `MerkleCRH^Orchard(layer, left, right)` with `layer = 31 - l` the height of the
 /// children: `SinsemillaHash` of `I2LEBSP_10(layer) || left || right`, and `0` for `⊥`.
 pub fn merkle_crh(layer: u8, left: &Fp, right: &Fp) -> Fp {
-    let mut bits = le_bits(&[layer, 0], 10);
-    bits.extend(le_bits(&left.to_bytes(), 255));
-    bits.extend(le_bits(&right.to_bytes(), 255));
+    let mut bits = SecretScratch::new();
+    append_bits(&mut bits, &[layer, 0], 10);
+    append_bits(&mut bits, &left.to_bytes(), 255);
+    append_bits(&mut bits, &right.to_bytes(), 255);
     merkle_crh_domain().hash(&bits).unwrap_or(Fp::ZERO)
 }
 
@@ -631,10 +640,10 @@ pub fn redpallas_public_key(sk: &Fq) -> [u8; 32] {
 /// `SpendAuthSig^Orchard.Sign` (RedDSA, 5.4.7): `randomness` is 80 uniform secret bytes.
 pub fn redpallas_sign(sk: &Fq, message: &[u8], randomness: &[u8; 80]) -> [u8; 64] {
     let vk = redpallas_public_key(sk);
-    let nonce = h_star(&[randomness, &vk, message]);
+    let nonce = SecretBuffer(h_star(&[randomness, &vk, message]));
     let r = spend_auth_base().mul(&nonce).to_bytes();
     let c = h_star(&[&r, &vk, message]);
-    let s = nonce + c * *sk;
+    let s = *nonce + c * *sk;
     let mut out = [0u8; 64];
     out[..32].copy_from_slice(&r);
     out[32..].copy_from_slice(&s.to_bytes());

@@ -52,7 +52,7 @@ fn pool() -> Option<&'static Arc<Pool>> {
         for _ in 0..want {
             let worker_pool = Arc::clone(&pool);
             let spawned = std::thread::Builder::new()
-                .name(std::string::String::from("hem-verify"))
+                .name(std::string::String::from("qsag-agg-verify"))
                 .spawn(move || {
                     loop {
                         let ticket = {

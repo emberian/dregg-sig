@@ -1,0 +1,24 @@
+[package]
+name = "dregg-sig-ass2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ASS2 / Dregg-64: fixed-width 32-bit little-endian constant-time cryptographic RISC. Zero-dependency no_std instruction codec, two-pass assembler, disassembler, and cycle-accurate reference VM with a built-in DIT taint auditor."
+
+[features]
+default = ["alloc"]
+alloc = []
+# VM-only nonblocking debug receiver at CSR 0x0B. The base RTL reserves this address.
+vm-debug-rx = []
+std = ["alloc", "dregg-sig-core/std", "dregg-sig-accel/std"]
+
+[dependencies]
+# Strictly zero external crates.io dependencies.
+dregg-sig-core = { path = "../core", default-features = false }
+dregg-sig-accel = { path = "../accel", default-features = false }
+
+[dev-dependencies]
+# Independent references for the differential tests (Fp5, Keccak-p[1600, 12], Goldilocks).
+dregg-sig-agg = { path = "../agg" }
+dregg-sig-fts = { path = "../fts" }

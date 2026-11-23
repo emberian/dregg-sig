@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Hem post-quantum K-to-1 hash signature aggregation over GoldilocksExt4: multilinear sumcheck with WHIR rate-escalated Steiner multiproofs"
+description = "Hem post-quantum K-to-1 hash signature aggregation over Quintic Goldilocks Fp5: multilinear sumcheck with WHIR rate-escalated Canopy multiproofs and [DKT26] recursive IVC"
 
 [features]
 default = ["std"]
@@ -13,10 +13,11 @@ std = ["alloc", "dregg-sig-asm/std", "dregg-sig-core/std"]
 vulkan = ["std", "dep:dregg-sig-accel", "dregg-sig-accel/vulkan"]
 
 [dependencies]
+dregg-sig-cred = { path = "../cred", default-features = false }
 dregg-sig-core = { path = "../core", default-features = false }
 dregg-sig-accel = { path = "../accel", optional = true, default-features = false }
-dregg-sig-whir-verified = { path = "../whir-verified", default-features = false }
 dregg-sig-asm = { path = "../asm", default-features = false }
+dregg-sig-whir-verified = { path = "../whir-verified", default-features = false }
 
 [dev-dependencies]
 # Reference implementation whose internal matrix is analysed by its own unit tests.

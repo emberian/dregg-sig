@@ -133,8 +133,8 @@ use alloc::vec::Vec;
 use dregg_sig_accel::keccak::{cshake256_framed_32, keccak256 as keccak256_native};
 use dregg_sig_accel::sha2 as sha2_native;
 use dregg_sig_agg::field::Goldilocks;
-use dregg_sig_agg::pcs::WhirSecurityRegime;
-use dregg_sig_agg::zk_hem::protocol::{self, ZkHemError, ZkHemProof};
+use dregg_sig_agg::zk_hem::v2::params::Profile;
+use dregg_sig_agg::zk_hem::v2::protocol::{self as protocol, ZkHemV2Error, ZkHemV2Proof};
 use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Def, Definitions, Lc, Shape, Source};
 
 use super::curve::{
@@ -1666,7 +1666,7 @@ fn build(
 ) -> (Shape, Vec<F>, usize) {
     let cs = build_in(ConstraintSystem::new(), lock, source, public_bits, witness);
     let rows = cs.num_rows();
-    let (shape, assignment) = cs.finish();
+    let (shape, assignment) = cs.finish_v2();
     (shape, assignment, rows)
 }
 
@@ -1940,7 +1940,7 @@ fn synthesize_shared(
             (shape, assignment)
         }
         None => {
-            let (shape, assignment) = synthesize(ConstraintSystem::new()).finish();
+            let (shape, assignment) = synthesize(ConstraintSystem::new()).finish_v2();
             (keep_shape(relation, shape), assignment)
         }
     }
@@ -1960,7 +1960,7 @@ pub enum OwnershipError {
     MalformedStatement,
     /// The witness does not produce the statement's credential and nullifier.
     WitnessMismatch,
-    Proof(ZkHemError),
+    Proof(ZkHemV2Error),
 }
 
 /// The relation of `statement` with the assignment for `witness`, after checking natively
@@ -2033,13 +2033,13 @@ fn synthesize_ownership_shared(
     ))
 }
 
-fn with_regime(mut bytes: Vec<u8>, regime: WhirSecurityRegime) -> Vec<u8> {
-    bytes.push(regime as u8);
+fn with_regime(mut bytes: Vec<u8>, regime: Profile) -> Vec<u8> {
+    bytes.push(regime.wire_tag());
     bytes
 }
 
 /// The statement bytes [`prove_ownership`] and [`verify_ownership`] hand to zk-Hem.
-pub fn ownership_transcript(statement: &OwnershipStatement, regime: WhirSecurityRegime) -> Vec<u8> {
+pub fn ownership_transcript(statement: &OwnershipStatement, regime: Profile) -> Vec<u8> {
     with_regime(statement.to_bytes(), regime)
 }
 
@@ -2317,7 +2317,7 @@ fn build_batch(
         secret,
     );
     let rows = cs.num_rows();
-    let (shape, assignment) = cs.finish();
+    let (shape, assignment) = cs.finish_v2();
     (shape, assignment, rows)
 }
 
@@ -2424,7 +2424,7 @@ fn check_batch(
 }
 
 /// The statement bytes [`prove_batch`] and [`verify_batch`] hand to zk-Hem.
-pub fn batch_transcript(batch: &BatchStatement, regime: WhirSecurityRegime) -> Vec<u8> {
+pub fn batch_transcript(batch: &BatchStatement, regime: Profile) -> Vec<u8> {
     with_regime(batch.to_bytes(), regime)
 }
 
@@ -2435,15 +2435,15 @@ pub fn batch_transcript(batch: &BatchStatement, regime: WhirSecurityRegime) -> V
 /// An ownership proof, for one statement or one batch, under one regime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnershipProof {
-    pub regime: WhirSecurityRegime,
-    pub proof: ZkHemProof,
+    pub regime: Profile,
+    pub proof: ZkHemV2Proof,
 }
 
 impl OwnershipProof {
     /// `magic(8) || regime || zk-Hem proof`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = PROOF_MAGIC.to_vec();
-        out.push(self.regime as u8);
+        out.push(self.regime.wire_tag());
         out.extend_from_slice(&self.proof.to_bytes());
         out
     }
@@ -2451,11 +2451,9 @@ impl OwnershipProof {
     fn decode(bytes: &[u8], shape: Option<Arc<Shape>>) -> Option<Self> {
         let rest = bytes.strip_prefix(PROOF_MAGIC.as_slice())?;
         let (&regime, rest) = rest.split_first()?;
-        let regime = WhirSecurityRegime::from_u8(regime)?;
-        Some(Self {
-            regime,
-            proof: ZkHemProof::from_bytes(rest, &*shape?, regime)?,
-        })
+        let regime = Profile::from_wire_tag(regime)?;
+        let proof = ZkHemV2Proof::from_bytes(rest, &*shape?)?;
+        (proof.profile == regime).then_some(Self { regime, proof })
     }
 
     /// Strict decoding against the statement the proof is for: a known regime and a
@@ -2473,7 +2471,7 @@ impl OwnershipProof {
 fn prove(
     synthesized: Result<(Arc<Shape>, Vec<F>), OwnershipError>,
     transcript: &[u8],
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
 ) -> Result<OwnershipProof, OwnershipError> {
     let (shape, assignment) = synthesized?;
@@ -2487,7 +2485,7 @@ fn prove(
 pub fn prove_ownership(
     statement: &OwnershipStatement,
     witness: &OwnershipWitness,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
 ) -> Result<OwnershipProof, OwnershipError> {
     prove(
@@ -2502,7 +2500,7 @@ pub fn prove_ownership(
 /// [`OwnershipStatement::binding`] is what the registry should record.
 pub fn verify_ownership(
     statement: &OwnershipStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     proof: &OwnershipProof,
 ) -> bool {
     let (Some(shape), Some(public_inputs)) =
@@ -2511,6 +2509,7 @@ pub fn verify_ownership(
         return false;
     };
     proof.regime == regime
+        && proof.proof.profile == regime
         && protocol::verify(
             &shape,
             &public_inputs,
@@ -2524,7 +2523,7 @@ pub fn verify_ownership(
 pub fn prove_batch(
     batch: &BatchStatement,
     witness: &OwnershipWitness,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     seed: &[u8; 32],
 ) -> Result<OwnershipProof, OwnershipError> {
     prove(
@@ -2539,13 +2538,14 @@ pub fn prove_batch(
 /// should record.
 pub fn verify_batch(
     batch: &BatchStatement,
-    regime: WhirSecurityRegime,
+    regime: Profile,
     proof: &OwnershipProof,
 ) -> bool {
     let (Some(shape), Some(public_inputs)) = (batch_shape(batch), batch.public_inputs()) else {
         return false;
     };
     proof.regime == regime
+        && proof.proof.profile == regime
         && protocol::verify(
             &shape,
             &public_inputs,
@@ -2562,7 +2562,7 @@ mod tests {
     use std::string::String;
     use std::sync::OnceLock;
 
-    const REGIME: WhirSecurityRegime = WhirSecurityRegime::BciksJohnsonQrom128;
+    const REGIME: Profile = Profile::TurboShakeJohnson400;
     const PQ: [u8; 32] = [0x51; 32];
     const DOMAIN: [u8; 32] = [0xd0; 32];
     const EPOCH: u64 = 7;
@@ -3416,7 +3416,7 @@ mod tests {
             );
             assert_eq!(shape.num_public, public.len());
             assert!(
-                rows > 80_000 && rows + 12 <= shape.num_rows(),
+                rows > 80_000 && rows + 15 <= shape.num_rows(),
                 "{name}: {rows}"
             );
             assert_eq!(st.public_inputs().unwrap(), z[1..=public.len()]);
@@ -3823,7 +3823,7 @@ mod tests {
             assert!(!verify_ownership(&other, REGIME, proof), "{field}, {name}");
         }
         // The regime is the verifier's choice and is bound.
-        let other_regime = WhirSecurityRegime::Cdhz25JohnsonQrom128;
+        let other_regime = Profile::CshakeJohnson400;
         assert!(!verify_ownership(st, other_regime, proof));
         let mut relabelled = proof.clone();
         relabelled.regime = other_regime;
@@ -3999,67 +3999,67 @@ mod tests {
     const PINNED_SHAPE_DIGESTS: &[(&str, &str)] = &[
         (
             "p2pkh/key",
-            "5dd41609885ad8ffdeb9e15393b0a34eb6f6f0b12189944b485b364208625511",
+            "71193bc85c2e47f90d295d258496ebb96ddf422a0dd77a52a6cdfa6b3f70b7ab",
         ),
         (
             "p2pkh-uncompressed/key",
-            "97ffead9d859dd7ff1391ca14b481f02626f55534581608c0badf5a14f6082db",
+            "c6f21cbf478a43beda62c6c13b7d7098f7c9277314bceb0eff54ac54b6d07214",
         ),
         (
             "p2sh-p2wpkh/key",
-            "91e5a1b2bb9125c3ccf8a42d3f7f2c52e368df6780051cf7493ac2740f81b6c7",
+            "4de945a9723a55597b989d898d517eaa88417d09cf703e1228fa48956f3e9401",
         ),
         (
             "ethereum/key",
-            "529ca2d4f9d6f069872486e1e308d245722018f237e0d75889c809670f4d1a46",
+            "fd4ed9d655cd8b55bf02428f7a4ca8d253d95fd1793fc4b76cea49a8f9a11b89",
         ),
         (
             "taproot/key",
-            "63b3b676596cf98112a2bc66c44a96e8d6425c8b9031b3c06f2bf846d2716c60",
+            "1c5810b03a98c227d3bad400106c5769dfb8deac17315007daa3e44e1fc30169",
         ),
         (
             "taproot-tree/key",
-            "e448f5fb7def865ec357b7a8a416ebec04d59d832736a53d5121e4460dd9b9c4",
+            "1c005bbbe6b1dd44d07425985605dad242e4366148926164cfda368be13bc254",
         ),
         (
             "ed25519/seed",
-            "4f5de0450a9ab81e18978c8ec1cc3a0d95f8c6438c8bd59cc77c131666ad7999",
+            "7a6bdcb632533a035af62eee82a452a1990ebc19efeaaad636ad192bee3edb78",
         ),
         (
             "ed25519/slip10",
-            "c8e1a06e475f93f6039a815fe2bf784750acd526e2acb89e6bb06ad30fa63ce8",
+            "551542ca4f0e57ffcd9839e4e51daf9c593befe460e6e8f25265e74d4a98a774",
         ),
         (
             "ed25519/slip10-hidden",
-            "37662cb73c273e7195199e178eebe09ef4e82e343fcce3f72db8fa193302a509",
+            "83974ea8da57c79208e4c2c18f0d91300dd2a8fc304e30a2611a207ac8da3dfc",
         ),
         (
             "ed25519/bip32-ed25519",
-            "beec6217f6c3838fb5acd8c846fc65612034afe95ec79f94a7f5713ae42b7b4f",
+            "f94af36ca3634ffde480b7270c7e5a59a97882020ffb66c185d000bf731d6f85",
         ),
         (
             "p2pkh/bip32-seed",
-            "970f9c66748912295193fea0dc9f473e8b557bf09f682801fab12dc4ecf42da3",
+            "559743eee89f77ae97cf8a063b2a753c8ec197897042154418ea71634111d535",
         ),
         (
             "ethereum/bip32-seed",
-            "2901bd0c85fe4a657abe795c7081fcd2e1c8b0636ddbab5b3b46e1289fc05cea",
+            "454ff078ca668b7a0f8241ebcb7101ecf47a8d99e7fe485d8446c3cc0b642029",
         ),
         (
             "taproot/bip32-xprv",
-            "726ec637dbb842871fc05d394195d33f0efb60d8706103faed0e17e8ae361e3a",
+            "465db673fc9c5ccd6d04e95d5b5fd1ca08dc90091f2f39eb550580e8936eacb2",
         ),
         (
             "p2pkh/bip32-hidden",
-            "8a329751b001549eedf2c0a0b9b78f0003b3ed4a20d9059d76889a1e75fe3cab",
+            "3dc1ebbb0f6d78fb1af2a5b7373f6dd6aaa573a02b1097cfccb31089b81b004b",
         ),
         (
             "bls-withdrawal/key",
-            "2aea5380fa764cdf978bac6747d96dc72629e0cd199705eacf05798050835926",
+            "518e18cc1f9cf7e5f38b702bf73e24abc2a2dbce2378e4e927308ed6bee03e0b",
         ),
         (
             "batch",
-            "1e2db1f76e594dcb42f816a35dc485c1d93c988a098dbe21b61173039d33e8d4",
+            "aa463fcd6b9ffbd54077f148332571f74e09b6090d9b8aaa3ff28818f9c8bac2",
         ),
     ];
 
@@ -4287,7 +4287,7 @@ mod tests {
         prove: &dyn Fn() -> OwnershipProof,
         verify: &dyn Fn(&[u8]) -> bool,
     ) {
-        let layout = protocol::Layout::new(&shape, REGIME).unwrap();
+        let layout = protocol::layout_of(&shape).unwrap();
         let stages: Vec<String> = layout
             .schedule
             .stages
@@ -4297,7 +4297,7 @@ mod tests {
         let head = std::format!(
             "HEM_OWNERSHIP statement=\"{name}\" regime={} rows={rows} padded_rows=2^{} vars={} \
              public_inputs={} cells=2^{} nnz={} synth_s={synth_s:.2} synth_peak_rss_mib={}",
-            REGIME as u8,
+            REGIME.wire_tag(),
             shape.log_rows,
             shape.num_vars,
             shape.num_public,

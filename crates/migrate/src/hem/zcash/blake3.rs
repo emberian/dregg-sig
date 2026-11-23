@@ -87,11 +87,12 @@ pub fn context_key(context: &str) -> [u32; 8] {
 /// `BLAKE3.derive_key(context, key_material, 32)` for a context and key material of at
 /// most 64 bytes each.
 pub fn derive_key_32(context: &str, key_material: &[u8]) -> [u8; 32] {
-    let words = compress_root(&context_key(context), key_material, DERIVE_KEY_MATERIAL);
+    let mut words = compress_root(&context_key(context), key_material, DERIVE_KEY_MATERIAL);
     let mut out = [0u8; 32];
     for (o, w) in out.chunks_exact_mut(4).zip(&words) {
         o.copy_from_slice(&w.to_le_bytes());
     }
+    dregg_sig_asm::volatile_fill(&mut words, 0);
     out
 }
 

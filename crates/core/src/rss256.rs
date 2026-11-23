@@ -822,14 +822,27 @@ fn fe_from_xof(xof: &mut Cshake256Xof) -> Fe {
     [u64::from_le_bytes(lo), u64::from_le_bytes(hi)]
 }
 
-/// `v * x^i` for `i < 128`.
+/// `v * x^i` for `i < 128`, evaluated with branchless/cmov-free 64-bit limb masks.
 #[inline]
 fn fe_mul_x_pow(v: Fe, i: u32) -> Fe {
     debug_assert!(i < 128);
-    let v = u128::from(v[0]) | (u128::from(v[1]) << 64);
-    let low = v << i;
-    // The coefficients pushed past x^127, as a polynomial of degree below `i`.
-    let high = (v >> 1) >> (127 - i);
+    let (v0, v1) = (v[0], v[1]);
+    let s = i & 63;
+    let inv_s = 64u32.wrapping_sub(s) & 63;
+    let ge64 = 0u64.wrapping_sub(core::hint::black_box(u64::from((i >> 6) & 1)));
+    let nz = 0u64.wrapping_sub(core::hint::black_box(u64::from(s).wrapping_neg() >> 63));
+
+    let shl0 = v0 << s;
+    let shl1 = (v1 << s) | (nz & (v0 >> inv_s));
+    let low = u128::from(!ge64 & shl0) | (u128::from((!ge64 & shl1) | (ge64 & shl0)) << 64);
+
+    // Coefficients pushed past x^127 (`v >> (128 - i)` for `1 <= i < 128`, `0` for `i == 0`).
+    let shr_v1 = nz & (v1 >> inv_s);
+    let shr_pair = (nz & (v0 >> inv_s)) | (v1 << s);
+    let high0 = (!ge64 & shr_v1) | (ge64 & shr_pair);
+    let high1 = ge64 & shr_v1;
+    let high = u128::from(high0) | (u128::from(high1) << 64);
+
     // x^128 = x^7 + x^2 + x + 1; a second fold absorbs what the first pushes out again.
     let fold = |h: u128| h ^ (h << 1) ^ (h << 2) ^ (h << 7);
     let again = (high >> 127) ^ (high >> 126) ^ (high >> 121);
@@ -873,7 +886,9 @@ fn ternary_expand<E: TensorCell>(buf: &mut [E], bits: usize, row: usize) {
     for level in (1..=bits).rev() {
         let half = (1usize << (level - 1)) * row;
         let third = 3usize.pow(level as u32 - 1) * row;
-        for region in buf[..regions * 3 * third].chunks_exact_mut(3 * third) {
+        let step = 3 * third;
+        for r_idx in 0..regions {
+            let region = &mut buf[r_idx * step..(r_idx + 1) * step];
             let (input, sums) = region.split_at_mut(2 * third);
             let (low, high) = input[..2 * half].split_at(half);
             for ((sum, a), b) in sums[..half].iter_mut().zip(low).zip(high) {
@@ -1105,8 +1120,15 @@ fn linear_terms(
     {
         let workers = rss256_worker_threads();
         if workers > 1 && groups >= 16 {
-            let chunks_per_slot = (workers / 3).max(1).min(groups);
-            let chunk_size = groups.div_ceil(chunks_per_slot);
+            let log_cps: u32 = if workers >= 12 && groups >= 4 {
+                2
+            } else if workers >= 6 && groups >= 2 {
+                1
+            } else {
+                0
+            };
+            let chunks_per_slot = 1usize << log_cps;
+            let chunk_size = (groups + chunks_per_slot - 1) >> log_cps;
             let partials: Vec<(usize, [[Fe; 2]; 2])> = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(3 * chunks_per_slot);
                 for s in 0..3 {
@@ -1263,9 +1285,11 @@ fn tensor_tables(
     let num_batches = groups.div_ceil(TENSOR_BATCH);
     #[cfg(feature = "std")]
     {
-        let workers = rss256_worker_threads().min(num_batches);
-        if workers > 1 {
-            let chunk_size = num_batches.div_ceil(workers);
+        let max_workers = rss256_worker_threads().min(num_batches);
+        if max_workers > 1 {
+            let log_w = max_workers.ilog2() & 31;
+            let workers = 1usize << log_w;
+            let chunk_size = (num_batches + workers - 1) >> log_w;
             let partials = SecretBuffer(std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(workers);
                 for w_idx in 0..workers {
@@ -1302,44 +1326,40 @@ fn tensor_tables(
 
 fn bind_planes_chunk(
     planes: &[Plane],
-    pattern: &[[u8; GROUP_PLANES / 4]; 128],
+    pats: &[dregg_sig_asm::XorCombinePattern; 2],
     lane_weights: bool,
     out: &mut [Fe],
 ) {
-    const NIBBLES: usize = GROUP_PLANES / 4;
-    let mut tables = SecretBuffer([[[0u64; 4]; 16]; NIBBLES]);
-    let mut lo = SecretBuffer([[0u64; 4]; 64]);
-    let mut hi = SecretBuffer([[0u64; 4]; 64]);
+    let mut combined_lo = SecretBuffer([[[0u64; 4]; 64]; 2]);
+    let mut combined_hi = SecretBuffer([[[0u64; 4]; 64]; 2]);
     let groups = planes.as_chunks::<GROUP_PLANES>().0.iter();
     for (src, dst) in groups.zip(out.as_chunks_mut::<LANES>().0) {
-        for (n, table) in tables.iter_mut().enumerate() {
-            for v in 1..16usize {
-                let rest = table[v & (v - 1)];
-                table[v] = rest.xor(src[4 * n + v.trailing_zeros() as usize]);
+        let [rows_lo, rows_hi] = src.as_chunks::<64>().0 else {
+            unreachable!("GROUP_PLANES is 2 * 64");
+        };
+        dregg_sig_asm::gf2_xor_combine_planes(rows_lo, &pats[0], &mut combined_lo);
+        dregg_sig_asm::gf2_xor_combine_planes(rows_hi, &pats[1], &mut combined_hi);
+        for half in 0..2 {
+            for r in 0..64 {
+                combined_lo[half][r] = combined_lo[half][r].xor(combined_hi[half][r]);
             }
         }
-        for (t, row) in pattern.iter().enumerate() {
-            let mut acc = [0u64; 4];
-            for (table, nibble) in tables.iter().zip(row) {
-                acc = acc.xor(table[usize::from(*nibble & 15)]);
+        let [lo, hi] = &mut *combined_lo;
+        dregg_sig_asm::transpose64x256(lo);
+        dregg_sig_asm::transpose64x256(hi);
+        if lane_weights {
+            for q in 0..4 {
+                for c in 0..64 {
+                    let lane = 64 * q + c;
+                    dst[lane] =
+                        fe_mul_x_pow([lo[c][q], hi[c][q]], (lane % BLOCK_LANES) as u32);
+                }
             }
-            if t < 64 {
-                lo[t] = acc;
-            } else {
-                hi[t - 64] = acc;
-            }
-        }
-        dregg_sig_asm::transpose64x256(&mut lo);
-        dregg_sig_asm::transpose64x256(&mut hi);
-        for q in 0..4 {
-            for c in 0..64 {
-                let lane = 64 * q + c;
-                let v = [lo[c][q], hi[c][q]];
-                dst[lane] = if lane_weights {
-                    fe_mul_x_pow(v, (lane % BLOCK_LANES) as u32)
-                } else {
-                    v
-                };
+        } else {
+            for q in 0..4 {
+                for c in 0..64 {
+                    dst[64 * q + c] = [lo[c][q], hi[c][q]];
+                }
             }
         }
     }
@@ -1348,23 +1368,35 @@ fn bind_planes_chunk(
 /// Bind the plane index inside every group: element `256 g + lane` of `out` is
 /// `sum_u eq[u] * bit(planes[128 g + u], lane)`, times `x^(lane % 128)` when `lane_weights`.
 fn bind_planes(planes: &[Plane], eq: &[Fe], lane_weights: bool, out: &mut [Fe]) {
-    const NIBBLES: usize = GROUP_PLANES / 4;
     debug_assert_eq!(eq.len(), GROUP_PLANES);
-    debug_assert_eq!(planes.len() / GROUP_PLANES * LANES, out.len());
-    let mut pattern = [[0u8; NIBBLES]; 128];
-    for (t, row) in pattern.iter_mut().enumerate() {
-        for (n, nibble) in row.iter_mut().enumerate() {
+    debug_assert_eq!((planes.len() / GROUP_PLANES) * LANES, out.len());
+    let mut pats: [dregg_sig_asm::XorCombinePattern; 2] = [[[0u8; 16]; 128]; 2];
+    for t in 0..128 {
+        for n in 0..16 {
+            let mut nib_lo = 0u8;
+            let mut nib_hi = 0u8;
             for d in 0..4 {
-                *nibble |= (((eq[4 * n + d][t / 64] >> (t % 64)) & 1) as u8) << d;
+                nib_lo |= (((eq[4 * n + d][t / 64] >> (t % 64)) & 1) as u8) << d;
+                nib_hi |= (((eq[64 + 4 * n + d][t / 64] >> (t % 64)) & 1) as u8) << d;
             }
+            pats[0][t][n] = nib_lo;
+            pats[1][t][n] = nib_hi;
         }
     }
     #[cfg(feature = "std")]
     {
         let num_groups = planes.len() / GROUP_PLANES;
-        let sub_workers = (rss256_worker_threads() / 3).max(1).min(num_groups);
+        let workers = rss256_worker_threads();
+        let log_sw: u32 = if workers >= 12 && num_groups >= 4 {
+            2
+        } else if workers >= 6 && num_groups >= 2 {
+            1
+        } else {
+            0
+        };
+        let sub_workers = 1usize << log_sw;
         if sub_workers > 1 && num_groups >= 32 {
-            let groups_per_worker = num_groups.div_ceil(sub_workers);
+            let groups_per_worker = (num_groups + sub_workers - 1) >> log_sw;
             std::thread::scope(|scope| {
                 let mut rest_planes = planes;
                 let mut rest_out = out;
@@ -1374,23 +1406,23 @@ fn bind_planes(planes: &[Plane], eq: &[Fe], lane_weights: bool, out: &mut [Fe]) 
                     let (o_head, o_tail) = rest_out.split_at_mut(take_g * LANES);
                     rest_planes = p_tail;
                     rest_out = o_tail;
-                    let pat_ref = &pattern;
+                    let pats_ref = &pats;
                     scope.spawn(move || {
-                        bind_planes_chunk(p_head, pat_ref, lane_weights, o_head);
+                        bind_planes_chunk(p_head, pats_ref, lane_weights, o_head);
                     });
                 }
             });
             return;
         }
     }
-    bind_planes_chunk(planes, &pattern, lane_weights, out);
+    bind_planes_chunk(planes, &pats, lane_weights, out);
 }
 
 /// Scratch of [`fold_round_sums`]: the expansions of both vectors of every slot.
 struct FoldScratch {
     ex: [Vec<Fe>; 3],
     ey: [Vec<Fe>; 3],
-    pending: Vec<Fe>,
+    pending: crate::wipe::SecretScratch<Fe>,
 }
 
 impl FoldScratch {
@@ -1399,7 +1431,7 @@ impl FoldScratch {
         Self {
             ex: core::array::from_fn(|_| vec![FE_ZERO; cells]),
             ey: core::array::from_fn(|_| vec![FE_ZERO; cells]),
-            pending: Vec::new(),
+            pending: crate::wipe::SecretScratch::new(),
         }
     }
 }
@@ -1410,7 +1442,6 @@ impl Drop for FoldScratch {
             dregg_sig_asm::volatile_fill(&mut self.ex[s], FE_ZERO);
             dregg_sig_asm::volatile_fill(&mut self.ey[s], FE_ZERO);
         }
-        dregg_sig_asm::volatile_fill(&mut self.pending, FE_ZERO);
     }
 }
 
@@ -1429,11 +1460,15 @@ fn fold_round_sums(
     batch_weights: Option<&[Fe]>,
     scratch: &mut FoldScratch,
 ) -> [Vec<Fe>; 3] {
-    debug_assert!(bits <= FOLD_BITS && batch_chunks <= FOLD_BATCH_CHUNKS);
-    let points = 3usize.pow(bits as u32);
-    let size = 1usize << bits;
-    let chunks = len.div_ceil(size);
-    let batches = chunks.div_ceil(batch_chunks);
+    debug_assert!(
+        bits <= FOLD_BITS && batch_chunks <= FOLD_BATCH_CHUNKS && batch_chunks.is_power_of_two()
+    );
+    let bits_shift = (bits as u32) & 7;
+    let bc_shift = batch_chunks.trailing_zeros() & 31;
+    let points = 3usize.pow(bits_shift);
+    let size = 1usize << bits_shift;
+    let chunks = (len + size - 1) >> bits_shift;
+    let batches = (chunks + batch_chunks - 1) >> bc_shift;
     let mut tabs: [Vec<Fe>; 3] = core::array::from_fn(|_| vec![FE_ZERO; points]);
     let FoldScratch { ex, ey, pending } = scratch;
     pending.clear();
@@ -1493,9 +1528,11 @@ fn fold_round_sums(
 /// Bind the low `eq.len().ilog2()` index bits of `v[..len]` in place and return the new length.
 fn fold_vector(v: &mut [Fe], len: usize, eq: &[Fe]) -> usize {
     let size = eq.len();
-    let chunks = len.div_ceil(size);
+    debug_assert!(size.is_power_of_two());
+    let shift = size.trailing_zeros() & 31;
+    let chunks = (len + size - 1) >> shift;
     for c in 0..chunks {
-        let lo = c * size;
+        let lo = c << shift;
         let hi = (lo + size).min(len);
         let mut acc = FE_ZERO;
         dregg_sig_asm::gf2_128_mul_acc_batch(&mut acc, &v[lo..hi], &eq[..hi - lo]);
@@ -2556,9 +2593,10 @@ impl Rss256Engine {
                 if weighted {
                     per_block >>= bits;
                     if per_block <= WEIGHTED_BLOCK_ELEMS {
+                        let pb_shift = per_block.trailing_zeros() & 31;
                         for xs in x.iter_mut() {
                             for (j, v) in xs[..len].iter_mut().enumerate() {
-                                *v = gf128_mul(block_weights[j / per_block], *v);
+                                *v = gf128_mul(block_weights[j >> pb_shift], *v);
                             }
                         }
                     }

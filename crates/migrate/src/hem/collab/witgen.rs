@@ -218,9 +218,11 @@ impl From<MpcError> for WitgenError {
     }
 }
 
+use dregg_sig_core::wipe::{SecretBuffer, SecretScratch, SecretWipe};
+
 /// The operations of the authenticated engine that witness generation uses.
 pub trait Backend {
-    type S: Copy + Add<Output = Self::S> + Sub<Output = Self::S>;
+    type S: Copy + SecretWipe + Add<Output = Self::S> + Sub<Output = Self::S>;
     fn scale(s: Self::S, k: F) -> Self::S;
     fn public(&self, c: F) -> Self::S;
     fn random(&mut self) -> Result<Self::S, MpcError>;
@@ -261,6 +263,10 @@ impl<T: Transport> Backend for Engine<T> {
 /// A share that carries no value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unit;
+
+impl SecretWipe for Unit {
+    fn secret_wipe(&mut self) {}
+}
 
 impl Add for Unit {
     type Output = Unit;
@@ -643,13 +649,13 @@ pub enum Chains {
 pub const CHAINS: Chains = Chains::Mixed;
 
 /// Requests of the round being collected, and the results of the round before it.
-struct Queue<S> {
+struct Queue<S: SecretWipe + Copy> {
     round: u64,
-    xs: Vec<S>,
-    ys: Vec<S>,
-    opens: Vec<S>,
+    xs: SecretScratch<S>,
+    ys: SecretScratch<S>,
+    opens: SecretScratch<S>,
     checked: bool,
-    products: Vec<S>,
+    products: SecretScratch<S>,
     opened: Vec<F>,
 }
 
@@ -740,7 +746,7 @@ pub struct Witgen<'a, B: Backend> {
 
 type Shares<B> = Result<Vec<<B as Backend>::S>, WitgenError>;
 /// Random bits, and exact masks of 64 bits each.
-type Pool<S> = (Vec<S>, Vec<Vec<S>>);
+type Pool<S> = (SecretBuffer<Vec<S>>, SecretBuffer<Vec<Vec<S>>>);
 /// What a unit's dependencies are reported to: the terms of each form it reads.
 type Visit<'v> = dyn FnMut(&[(u32, F)]) + 'v;
 /// Two integers to be multiplied.
@@ -757,18 +763,18 @@ impl<'a, B: Backend> Witgen<'a, B> {
             b: RefCell::new(b),
             q: RefCell::new(Queue {
                 round: 0,
-                xs: Vec::new(),
-                ys: Vec::new(),
-                opens: Vec::new(),
+                xs: SecretScratch::new(),
+                ys: SecretScratch::new(),
+                opens: SecretScratch::new(),
                 checked: false,
-                products: Vec::new(),
+                products: SecretScratch::new(),
                 opened: Vec::new(),
             }),
             matrices: RefCell::new(BTreeMap::new()),
             unchecked: Cell::new(0),
             chains,
             counting,
-            pool: RefCell::new((Vec::new(), Vec::new())),
+            pool: RefCell::new((SecretBuffer(Vec::new()), SecretBuffer(Vec::new()))),
             asked: Cell::new((0, 0)),
             planning: false,
             zero,
@@ -842,7 +848,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
             self.check()?;
         }
         let (products, values) = self.b.borrow_mut().round(&q.xs, &q.ys, &q.opens)?;
-        q.products = products;
+        q.products = SecretScratch::from(products);
         q.opened = values;
         q.xs.clear();
         q.ys.clear();
@@ -894,12 +900,12 @@ impl<'a, B: Backend> Witgen<'a, B> {
     /// Shared uniform bits, two rounds.
     async fn fresh_bits(&self, n: usize) -> Shares<B> {
         let half = F::TWO.inv();
-        let mut out = Vec::with_capacity(n);
+        let mut out = SecretBuffer(Vec::with_capacity(n));
         while out.len() < n {
-            let a: Vec<B::S> = (0..n - out.len())
+            let a: SecretScratch<B::S> = (0..n - out.len())
                 .map(|_| self.random())
                 .collect::<Result<_, _>>()?;
-            let squares = self.mul(&a, &a).await?;
+            let squares = SecretScratch::from(self.mul(&a, &a).await?);
             let opened = self.open(&squares, false).await?;
             for (&a, &v) in a.iter().zip(&opened) {
                 if self.counting {
@@ -916,7 +922,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 }
             }
         }
-        Ok(out)
+        Ok(out.into_inner())
     }
 
     /// The products of every prefix of `first, ps[0], ps[1], ..` that has at least two
@@ -1047,8 +1053,10 @@ impl<'a, B: Backend> Witgen<'a, B> {
             .map(|_| Box::pin(self.fresh_mask()) as Boxed<'_, _>)
             .collect();
         let (bits, masks) = join2(self.fresh_bits(bits), join_all(futures)).await;
-        let masks = masks.into_iter().collect::<Result<Vec<_>, _>>()?;
-        *self.pool.borrow_mut() = (bits?, masks);
+        let bits = bits.map(SecretBuffer);
+        let guarded: Vec<_> = masks.into_iter().map(|result| result.map(SecretBuffer)).collect();
+        let masks = guarded.into_iter().collect::<Result<Vec<_>, _>>()?;
+        *self.pool.borrow_mut() = (bits?, SecretBuffer(masks.into_iter().map(SecretBuffer::into_inner).collect()));
         Ok(())
     }
 
@@ -2068,7 +2076,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
         }
         drop(fill);
 
-        let mut z = vec![self.zero; vars];
+        let mut z = SecretBuffer(vec![self.zero; vars]);
         z[0] = self.one;
         for (slot, &v) in z[1..].iter_mut().zip(public_inputs) {
             *slot = self.public(v);
@@ -2134,7 +2142,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
             self.wait(self.fill_pool(bits, masks))?;
         }
         // Multiplicities: the sum over the lookups of the indicator of each one's row.
-        let mut counts: Vec<B::S> = vec![self.zero; lookups.map_or(0, |l| l.num_table_rows)];
+        let mut counts = SecretScratch::from(vec![self.zero; lookups.map_or(0, |l| l.num_table_rows)]);
         let mut uncounted = lookups.map_or(0, |l| l.num_lookups);
         if let (Some(l), 0) = (lookups, uncounted) {
             for (r, &count) in counts.iter().enumerate() {
@@ -2147,7 +2155,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
         loop {
             // Start what is ready; a unit that finishes at once may make more ready.
             let mut next = 0;
-            let mut finished: Vec<(u32, Vec<B::S>)> = Vec::new();
+            let mut finished: Vec<(u32, SecretScratch<B::S>)> = Vec::new();
             loop {
                 while next < ready.len() {
                     let unit = ready[next] as usize;
@@ -2175,7 +2183,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
                     };
                     let mut task = task.ok_or(unsupported(unit))?;
                     match task.as_mut().poll(&mut cx) {
-                        Poll::Ready(values) => finished.push((unit as u32, values?)),
+                        Poll::Ready(values) => finished.push((unit as u32, SecretScratch::from(values?))),
                         Poll::Pending => active.push((unit as u32, task)),
                     }
                 }
@@ -2219,10 +2227,10 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 set(&mut z, &mut ready, var as usize, value);
             }
             // Every waiting task asked for something in the round that just ran.
-            let mut finished: Vec<(u32, Vec<B::S>)> = Vec::new();
+            let mut finished: Vec<(u32, SecretScratch<B::S>)> = Vec::new();
             for (unit, mut task) in core::mem::take(&mut active) {
                 match task.as_mut().poll(&mut cx) {
-                    Poll::Ready(values) => finished.push((unit, values?)),
+                    Poll::Ready(values) => finished.push((unit, SecretScratch::from(values?))),
                     Poll::Pending => active.push((unit, task)),
                 }
             }
@@ -2259,7 +2267,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
             return Err(unsupported(first));
         }
         self.check()?;
-        Ok(z)
+        Ok(z.into_inner())
     }
 }
 
@@ -2353,10 +2361,14 @@ pub(super) mod tests {
     impl Plain {
         pub(in super::super) fn new(tag: u8) -> Self {
             Self {
-                stream: SeedStream::new(b"DREGG.TEST.WITGEN", &[tag; 32]),
+                stream: SeedStream::new(b"QSAG.TEST.WITGEN", &[tag; 32]),
                 count: Count::default(),
             }
         }
+    }
+
+    impl SecretWipe for Clear {
+        fn secret_wipe(&mut self) { self.0.secret_wipe(); }
     }
 
     impl Backend for Plain {
@@ -2419,7 +2431,7 @@ pub(super) mod tests {
 
     #[test]
     fn public_integer_arithmetic_and_square_roots() {
-        let mut s = SeedStream::new(b"DREGG.TEST.WITGEN", &[1; 32]);
+        let mut s = SeedStream::new(b"QSAG.TEST.WITGEN", &[1; 32]);
         for _ in 0..200 {
             let a = s.next_base();
             if a != F::ZERO {
@@ -2466,7 +2478,7 @@ pub(super) mod tests {
     #[test]
     fn decomposition_is_exact_at_every_width_and_boundary() {
         let mut plain = Plain::new(2);
-        let mut s = SeedStream::new(b"DREGG.TEST.WITGEN", &[3; 32]);
+        let mut s = SeedStream::new(b"QSAG.TEST.WITGEN", &[3; 32]);
         let w = Witgen::new(&mut plain);
         for m in [1u32, 2, 8, 22, 23, 31, 32, 33, 40, 63, 64] {
             let top = if m == 64 {
@@ -2517,7 +2529,7 @@ pub(super) mod tests {
 
     #[test]
     fn residues_quotients_and_inverses_match_public_arithmetic() {
-        let mut s = SeedStream::new(b"DREGG.TEST.WITGEN", &[4; 32]);
+        let mut s = SeedStream::new(b"QSAG.TEST.WITGEN", &[4; 32]);
         let mut plain = Plain::new(5);
         let w = Witgen::new(&mut plain);
         let mut limbs = |n: usize, lo: i128, hi: i128| -> Vec<i128> {
@@ -3142,16 +3154,16 @@ pub(super) mod tests {
     #[test]
     fn a_quorum_proves_a_relation_with_lookups_from_shares_of_its_inputs() {
         use super::super::prover::{prove_party, prover_demand};
-        use dregg_sig_agg::pcs::WhirSecurityRegime;
-        use dregg_sig_agg::zk_hem::protocol::verify_split;
-        let regime = WhirSecurityRegime::default();
+        use dregg_sig_agg::zk_hem::v2::params::Profile;
+        use dregg_sig_agg::zk_hem::v2::protocol::verify_split;
+        let regime = Profile::default();
         let secret = [0x31, 0x07, 0xe0, 0x31];
         let (shape, assignment, defs) = byte_lookup_recorded(&secret, true);
         let publics = assignment[1..=shape.num_public].to_vec();
         let need = demand(&shape, &defs).unwrap();
         let prove = prover_demand(&shape, regime).unwrap();
-        for fault in [None, Some(2 * need.rounds / 3)] {
-            let mut dealer = Dealer::new(3, &[11; 32]);
+        for (idx, fault) in [None, Some(2 * need.rounds / 3)].into_iter().enumerate() {
+            let mut dealer = Dealer::new(3, &[11 + idx as u8; 32]);
             let inputs = deal_bits(&mut dealer, 3, &secret);
             let preps = dealer.preprocessing(need.triples + prove.0, need.randoms + prove.1);
             let out = run_engines(preps, fault, |e| {
@@ -3164,7 +3176,10 @@ pub(super) mod tests {
                 None => {
                     let proof = out[0].0.clone().unwrap();
                     assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
-                    assert!(verify_split(&shape, &publics, b"lookups", regime, &proof));
+                    assert!(
+                        proof.profile == regime
+                            && verify_split(&shape, &publics, b"lookups", regime, &proof)
+                    );
                     let mut other = publics.clone();
                     other[0] += F::ONE;
                     assert!(!verify_split(&shape, &other, b"lookups", regime, &proof));
@@ -3286,7 +3301,7 @@ pub(super) mod tests {
         // the run: random-bit squares, masked openings, Beaver openings, check rounds.
         let total = 2 * need.rounds;
         let mut aborted = 0;
-        for at in [
+        for (at_idx, at) in [
             0,
             1,
             2,
@@ -3297,16 +3312,51 @@ pub(super) mod tests {
             total / 3,
             total / 2,
             total - total / 5,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut rounds = Vec::new();
             for secret in [[0xa7, 0x3c, 0xf1, 0x5e], [0x19, 0x80, 0x02, 0xff]] {
                 let (shape, assignment, defs) = small_recorded(&secret);
                 let publics = assignment[1..=shape.num_public].to_vec();
-                let mut dealer = Dealer::new(3, &[7; 32]);
+                let mut dealer = Dealer::new(3, &[70 + at_idx as u8; 32]);
                 let inputs = deal_bits(&mut dealer, 3, &secret);
                 let preps = dealer.preprocessing(need.triples, need.randoms);
-                let out = run_engines(preps, Some(at), |e| {
-                    generate(e, &shape, &defs, &publics, &[inputs[e.me()].clone()]).map(|_| ())
+                let session = [4u8; 32];
+                let mesh = channel_mesh(session, preps.len());
+                let out: Vec<_> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = mesh
+                        .into_iter()
+                        .zip(preps)
+                        .enumerate()
+                        .map(|(p, (net, prep))| {
+                            let (shape, defs, publics, inputs) = (&shape, &defs, &publics, &inputs);
+                            scope.spawn(move || {
+                                let net = Faulty {
+                                    inner: net,
+                                    sent: 0,
+                                    at: if p == 1 { at } else { usize::MAX },
+                                };
+                                let mut e = Engine::new_for_obliviousness_test(
+                                    net,
+                                    prep,
+                                    &session,
+                                    &[p as u8 + 50; 32],
+                                );
+                                let res = generate(
+                                    &mut e,
+                                    shape,
+                                    defs,
+                                    publics,
+                                    &[inputs[p].clone()],
+                                )
+                                .map(|_| ());
+                                (res, e.stats.rounds)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
                 });
                 for p in [0, 2] {
                     assert!(

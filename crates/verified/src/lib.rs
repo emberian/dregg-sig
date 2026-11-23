@@ -6,13 +6,11 @@
 #![forbid(unsafe_code)]
 // Charon + Aeneas `0-FunsExternal` MIR extraction intentionally uses explicit `match`/branch/scalar
 // forms instead of `Try::branch` (`?`), closure `Option::map`, or `core::num::is_multiple_of`.
-// Permit and grant types carry a private unit field so that only this crate can construct them.
 #![allow(
     clippy::collapsible_if,
     clippy::if_same_then_else,
     clippy::manual_is_multiple_of,
     clippy::manual_map,
-    clippy::manual_non_exhaustive,
     clippy::needless_bool,
     clippy::question_mark,
     clippy::too_many_arguments
@@ -90,7 +88,6 @@ pub use rss_cut_session::{
 pub use threshold::{
     BoundEpochRecord, EpochAuthGrant, EpochLatch, EpochLatchError, EpochRequest, EpochSignRequest,
     LastBoundEpoch, RssShare64, RssZeroSeeds64, ct_eq_bytes32,
-    derive_jorts_legacy_v1_det_r_rand,
     dkg_beaver_frobenius_eval_gf256, dkg_beaver_frobenius_share_shamir_gf256,
     dkg_verify_key_shares_boolean_bdoz_gf256, dkg_verify_shamir_2of3_key_bit_gf256,
     epoch_latch_advance, rss_and_gate, rss_keccak_chi_lane, rss_not, rss_party_and_local,

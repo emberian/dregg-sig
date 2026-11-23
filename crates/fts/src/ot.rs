@@ -1,4 +1,4 @@
-//! Interactive correlated-OT-extension adapter over established Ring-LWE base-OT channels.
+//! Interactive KOS OT adapter over established Ring-LWE base-OT channels.
 //! Establish channels using the production `dregg_sig_core::preprocessing` base-OT
 //! round states, over mutually authenticated confidential transports. This
 //! adapter inherits their security bounds; it makes no new QROM security claim.
@@ -9,7 +9,7 @@ use dregg_sig_accel::ct::{ct_zeroize_bytes, ct_zeroize_u64s, ct_zeroize_u128s};
 use dregg_sig_accel::keccak::cshake256_framed_32;
 use dregg_sig_asm::wipe::{SecretBuffer, SecretVec};
 use dregg_sig_core::preprocessing::{
-    OtExtChallengeMsg, OtExtProofMsg, OtExtUColsMsg, OtExtReceiverChannel, OtExtSenderChannel,
+    KosOtChallengeMsg, KosOtProofMsg, KosOtUColsMsg, OtExtReceiverChannel, OtExtSenderChannel,
     OtPadPair, PartyPrivateRng,
 };
 
@@ -69,9 +69,9 @@ fn pad_batch(
 
 pub enum CommittedOtMessage {
     Abort,
-    Columns(OtExtUColsMsg),
-    Challenge(OtExtChallengeMsg),
-    Proof(OtExtProofMsg),
+    Columns(KosOtUColsMsg),
+    Challenge(KosOtChallengeMsg),
+    Proof(KosOtProofMsg),
     Ciphertexts(Vec<[u128; 2]>),
     /// Pad-masked field elements of a DKG product; at most `3 * MAX_OTS` of them.
     Words(Vec<u128>),
@@ -366,7 +366,7 @@ fn chunk_context(context: &[u8; 32], index: usize, total_bits: usize) -> [u8; 32
     )
 }
 impl<W: AuthenticatedOtWire> CommittedCorrelatedOt<W> {
-    /// The four OT-extension messages of every session in `peers`, one message kind at a time
+    /// The four KOS messages of every session in `peers`, one message kind at a time
     /// across all peers; the peers' extension work runs side by side. The pads come straight
     /// from the extension's correlation-robust hash, which already binds the base-OT session,
     /// the batch and the OT index.

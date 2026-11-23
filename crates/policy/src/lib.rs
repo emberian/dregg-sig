@@ -18,13 +18,13 @@ pub use biscuit::{
     PqBiscuitAuthorityKey, PqBiscuitAuthorityPublicKey, PqBiscuitHopBlock, PqBiscuitSeal,
     PqBiscuitStepKey, capability_request_digest,
 };
-pub use dregg_sig_addr::policy_signing_key_id;
 pub use durable::PolicyGuardError;
 #[cfg(feature = "std")]
 pub use durable::{FsPolicyDurableLedger, FsPolicyGenerationFence};
 pub use macaroon::{
     CapabilityError, CapabilityRequest, Caveat, Discharge, MacaroonVerifier, SpongeMacaroon,
 };
+pub use dregg_sig_addr::policy_signing_key_id;
 #[cfg(feature = "std")]
 pub use seal_store::{AnchoredSnapshot, FsSealConsumptionStore};
 pub use seal_store::{MemorySealConsumptionStore, SealConsumptionDomain};
@@ -2374,7 +2374,7 @@ pub trait PolicyAuthenticatedOt {
     ) -> Result<Vec<u128>, PolicyViolation>;
 }
 
-/// Production adapter using the interactive OT-extension consistency check and committed Ring-LWE base OT.
+/// Production adapter using the interactive KOS check and committed Ring-LWE base OT.
 /// The two directions run one after the other, never concurrently: for every chunk of at
 /// most 65,536 choices the party with the lower ID sends its pairs and then receives, and
 /// the party with the higher ID receives and then sends. The opposite orders at the two
@@ -6631,8 +6631,7 @@ mod cleanup_tests {
         drop(next_release);
 
         // 2. Ephemeral Compact1122 PqBiscuit 2-hop delegation chain + PoP seal gates BDOZ barrier!
-        let dp =
-            dregg_sig_fts::FrontierDpTable::build(dregg_sig_fts::FrontierFtsProfile::Compact1122);
+        let dp = dregg_sig_fts::FrontierDpTable::build(dregg_sig_fts::FrontierFtsProfile::Compact1122);
         let mut auth = PqBiscuitAuthorityKey::keygen([0xD1; 32], [0xD2; 32], 1, &accel).unwrap();
         let auth_pk = *auth.public_key();
         let mut intent2 = intent.clone();

@@ -52,9 +52,7 @@ use dregg_sig_asm::{KECCAK_ROTATION_OFFSETS, KECCAK_ROUND_CONSTANTS};
 use dregg_sig_core::belt_latch::DurableWal;
 use dregg_sig_core::keccak_mpc::RssKeyShare256;
 use dregg_sig_core::rss256::Shake256Prg256;
-#[cfg(any(test, feature = "testing-ephemeral"))]
-use dregg_sig_core::wipe::ct_eq_bytes32;
-use dregg_sig_core::wipe::{SecretBuffer, SecretVec, ct_eq_bytes};
+use dregg_sig_core::wipe::{SecretBuffer, SecretVec, ct_eq_bytes, ct_eq_bytes32};
 
 use crate::dzk::{
     DzkShape, Gf128, NodeBasis, challenge_points, data_node_sum, decode_elements, derive_weights,
@@ -66,7 +64,7 @@ use crate::quorum_jorts::{
     SHARE_OPENING_WIRE_BYTES, ShamirCustodian, ShareOpening, WOTS_CHAINS, combine_additive,
     combine_shamir_robust, quorum_jorts_verify,
 };
-use crate::wire_channel::{TransportError, WireTransport};
+use crate::wire_channel::{MacSealedWireChannel, TransportError, WireTransport};
 
 /// Round tags. The low byte of a gate round is the Keccak round index.
 pub const ROUND_GATE: u32 = 0x0100_0000;
@@ -276,8 +274,27 @@ pub struct IsolatedJortsParty<T: WireTransport, W: DurableWal> {
     transport: T,
 }
 
+impl<T: WireTransport, W: DurableWal> IsolatedJortsParty<MacSealedWireChannel<T>, W> {
+    /// Attach this custodian to a fresh, encrypted session in its enrolled deployment.
+    pub fn new_deployed(
+        deployment: Node,
+        session: Node,
+        mut custodian: CommitteeCustodian<W>,
+        transport: T,
+    ) -> Result<Self, NodeError> {
+        let keys = custodian.deployed_wire_keys(deployment)?;
+        let channel = MacSealedWireChannel::new_encrypted(transport, deployment, session, keys)?;
+        Self::from_transport(custodian, channel)
+    }
+}
+
 impl<T: WireTransport, W: DurableWal> IsolatedJortsParty<T, W> {
+    #[cfg(any(test, feature = "testing-ephemeral"))]
     pub fn new(custodian: CommitteeCustodian<W>, transport: T) -> Result<Self, NodeError> {
+        Self::from_transport(custodian, transport)
+    }
+
+    fn from_transport(custodian: CommitteeCustodian<W>, transport: T) -> Result<Self, NodeError> {
         if transport.party() != custodian.party() || transport.parties() != custodian.layout().n {
             return Err(NodeError::InvalidParameters);
         }
@@ -407,8 +424,27 @@ pub struct IsolatedQuorumParty<T: WireTransport, W: DurableWal> {
     transport: T,
 }
 
+impl<T: WireTransport, W: DurableWal> IsolatedQuorumParty<MacSealedWireChannel<T>, W> {
+    /// Attach this custodian to a fresh, encrypted session in its enrolled deployment.
+    pub fn new_deployed(
+        deployment: Node,
+        session: Node,
+        mut custodian: ShamirCustodian<W>,
+        transport: T,
+    ) -> Result<Self, NodeError> {
+        let keys = custodian.deployed_wire_keys(deployment)?;
+        let channel = MacSealedWireChannel::new_encrypted(transport, deployment, session, keys)?;
+        Self::from_transport(custodian, channel)
+    }
+}
+
 impl<T: WireTransport, W: DurableWal> IsolatedQuorumParty<T, W> {
+    #[cfg(any(test, feature = "testing-ephemeral"))]
     pub fn new(custodian: ShamirCustodian<W>, transport: T) -> Result<Self, NodeError> {
+        Self::from_transport(custodian, transport)
+    }
+
+    fn from_transport(custodian: ShamirCustodian<W>, transport: T) -> Result<Self, NodeError> {
         if transport.party() != custodian.party()
             || transport.parties() != custodian.config().parties()
         {
@@ -600,33 +636,41 @@ fn reconstruct_opened(
         .collect()
 }
 
-/// One party's replicated share of a `Keccak-f[1600]` state: share slot `party` and share
-/// slot `party + 1`. The state is the xor of the three slots.
-///
-/// Strictly move-only (`!Clone` in all profiles) and opaque outside this module (`R-Ex-10`):
-/// production callers enroll states exclusively via WAL/session-mediated
-/// [`IsolatedRss256Party::enroll_rss_key_block`], while test/`testing-ephemeral` harnesses
-/// consume party- and session-bound tickets once via [`IsolatedRss256Party::load_shares`].
-pub struct SharePair {
-    party: usize,
-    session_id: Option<[u8; 32]>,
-    mine: [u64; 25],
-    next: [u64; 25],
-}
-
-impl SharePair {
-    /// Custodian party index (`0..3`) bound to this state share pair.
-    #[inline]
-    pub const fn party(&self) -> usize {
-        self.party
+mod share_pair {
+    /// One party's replicated share of a `Keccak-f[1600]` state: share slot `party` and share
+    /// slot `party + 1`. The state is the xor of the three slots.
+    ///
+    /// Strictly move-only (`!Clone` in all profiles) and opaque outside `party_node` in production
+    /// builds (`R-Ex-10` / `R12`): production callers enroll states exclusively via WAL/session-
+    /// mediated [`super::IsolatedRss256Party::enroll_rss_key_block`], while test/`testing-ephemeral`
+    /// harnesses consume party- and session-bound tickets once via
+    /// [`super::IsolatedRss256Party::load_shares`].
+    pub struct SharePair {
+        pub(super) party: usize,
+        pub(super) session_id: Option<[u8; 32]>,
+        pub(super) mine: [u64; 25],
+        pub(super) next: [u64; 25],
     }
 
-    /// Optional session identifier bound to this state share pair.
-    #[inline]
-    pub const fn session_id(&self) -> Option<&[u8; 32]> {
-        self.session_id.as_ref()
+    impl SharePair {
+        /// Custodian party index (`0..3`) bound to this state share pair.
+        #[inline]
+        pub const fn party(&self) -> usize {
+            self.party
+        }
+
+        /// Optional session identifier bound to this state share pair.
+        #[inline]
+        pub const fn session_id(&self) -> Option<&[u8; 32]> {
+            self.session_id.as_ref()
+        }
     }
 }
+
+#[cfg(any(test, feature = "testing-ephemeral"))]
+pub use share_pair::SharePair;
+#[cfg(not(any(test, feature = "testing-ephemeral")))]
+pub(crate) use share_pair::SharePair;
 
 /// The secrets of one party of the replicated engine.
 #[derive(Clone)]
@@ -872,11 +916,45 @@ impl<T: WireTransport, J: PoisonJournal> Drop for IsolatedRss256Party<T, J> {
     }
 }
 
+impl<T: WireTransport, J: PoisonJournal> IsolatedRss256Party<MacSealedWireChannel<T>, J> {
+    pub fn new_deployed(
+        deployment: Node,
+        session: Node,
+        mut keys: Rss256PartyKeys,
+        transport: T,
+        journal: J,
+    ) -> Result<Self, NodeError> {
+        if keys.party >= 3 {
+            return Err(NodeError::InvalidParameters);
+        }
+        let mut links = vec![[0; 32]; 3];
+        for i in 0..2 {
+            links[(keys.party + 1 + i) % 3] =
+                mac32(&keys.mac_keys[i], b"QSAG.RSS.WIRE/v2", &[&deployment]);
+            keys.mac_keys[i] = mac32(&keys.mac_keys[i], b"QSAG.RSS.PERMIT/v2", &[&deployment]);
+            keys.slot_keys[i] = mac32(&keys.slot_keys[i], b"QSAG.RSS.SLOT/v2", &[&deployment]);
+        }
+        keys.rng_seed = mac32(&keys.rng_seed, b"QSAG.RSS.COINS/v2", &[&deployment]);
+        let channel = MacSealedWireChannel::new_encrypted(transport, deployment, session, links)?;
+        Self::from_transport(session, keys, channel, journal)
+    }
+}
+
 impl<T: WireTransport, J: PoisonJournal> IsolatedRss256Party<T, J> {
     /// A party of session `session_id`. If the journal already lists the session as
     /// poisoned, the party starts poisoned; otherwise construction atomically and durably
     /// reserves `session_id` before any protocol mask or coin can be derived.
+    #[cfg(any(test, feature = "testing-ephemeral"))]
     pub fn new(
+        session_id: Node,
+        keys: Rss256PartyKeys,
+        transport: T,
+        journal: J,
+    ) -> Result<Self, NodeError> {
+        Self::from_transport(session_id, keys, transport, journal)
+    }
+
+    fn from_transport(
         session_id: [u8; 32],
         keys: Rss256PartyKeys,
         transport: T,
@@ -1091,6 +1169,15 @@ impl<T: WireTransport, J: PoisonJournal> IsolatedRss256Party<T, J> {
         let mut pad_mine = Shake256Prg256::new(&self.slot_keys[0], &self.session_id, domain);
         let mut pad_next = Shake256Prg256::new(&self.slot_keys[1], &self.session_id, domain);
         let (succ, pred) = (self.succ(), self.pred());
+        for state in &self.states {
+            if state.party() != self.party
+                || state
+                    .session_id()
+                    .is_some_and(|sid| !ct_eq_bytes32(sid, &self.session_id))
+            {
+                return Err(NodeError::InvalidParameters);
+            }
+        }
         self.unverified = true;
         self.record
             .reserve(n.checked_mul(25 * 24).ok_or(NodeError::Poisoned)?)?;
@@ -1602,6 +1689,9 @@ impl Drop for SharePair {
     fn drop(&mut self) {
         dregg_sig_asm::volatile_fill(&mut self.mine[..], 0);
         dregg_sig_asm::volatile_fill(&mut self.next[..], 0);
+        if let Some(ref mut sid) = self.session_id {
+            dregg_sig_asm::volatile_fill(&mut sid[..], 0);
+        }
     }
 }
 impl core::fmt::Debug for Rss256PartyKeys {
@@ -2412,7 +2502,7 @@ mod tests {
                 )
                 .unwrap();
                 let wire =
-                    ConfidentialWireChannel::new(endpoint, SESSION, vec![[0xA7; 32]; 2]).unwrap();
+                    ConfidentialWireChannel::new(endpoint, [0xDA; 32], SESSION, vec![[0xA7; 32]; 2]).unwrap();
                 IsolatedJortsParty::new(custodian, wire).unwrap()
             })
             .collect();
@@ -2432,6 +2522,75 @@ mod tests {
             b"encrypted custody",
             &signatures[0]
         ));
+    }
+
+    /// Custodians enrolled in one deployment sign over the links `new_deployed` derives.
+    /// A custodian enrolled elsewhere shares no wire key with its peer, a bound custodian
+    /// refuses a second deployment, and re-deriving for the same one changes nothing.
+    #[test]
+    fn deployed_committee_signing_is_bound_to_the_enrolled_deployment() {
+        use crate::wire_channel::TcpWireMesh;
+        use core::time::Duration;
+        let custodians = || {
+            let staged = stage_committee_partitioned(2, 2, 2, &SEED).unwrap();
+            let pk = *staged.tree.public_key();
+            let custodians: Vec<_> = staged
+                .parties
+                .into_iter()
+                .map(|material| {
+                    let wals = vec![MemoryWal::new(); material.stores.len()];
+                    CommitteeCustodian::new(
+                        staged.layout.clone(),
+                        staged.tree.clone(),
+                        material,
+                        wals,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            (pk, custodians)
+        };
+        let sign = |deployments: [Node; 2]| {
+            let (pk, custodians) = custodians();
+            let (endpoints, _) = TcpWireMesh::with_timeout(Duration::from_secs(5))
+                .loopback(2, SESSION)
+                .unwrap();
+            let nodes: Vec<_> = endpoints
+                .into_iter()
+                .zip(custodians)
+                .zip(deployments)
+                .map(|((endpoint, custodian), deployment)| {
+                    IsolatedJortsParty::new_deployed(deployment, SESSION, custodian, endpoint)
+                        .unwrap()
+                })
+                .collect();
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = nodes
+                    .into_iter()
+                    .map(|mut node| scope.spawn(move || node.sign(0, 0, b"deployed custody")))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            (pk, results)
+        };
+
+        let (pk, same) = sign([[0xDA; 32]; 2]);
+        let signature = same[0].clone().unwrap();
+        assert_eq!(same[1].as_ref(), Ok(&signature));
+        assert!(quorum_jorts_verify(&pk, b"deployed custody", &signature));
+
+        let (_, split) = sign([[0xDA; 32], [0xDB; 32]]);
+        assert!(split.iter().all(Result::is_err), "{split:?}");
+
+        let (_, mut custodians) = custodians();
+        let custodian = &mut custodians[0];
+        let bound = custodian.deployed_wire_keys([0xDA; 32]).unwrap();
+        assert_eq!(custodian.deployed_wire_keys([0xDA; 32]).unwrap(), bound);
+        assert!(custodian.deployed_wire_keys([0xDB; 32]).is_err());
+        assert_eq!(custodian.deployed_wire_keys([0xDA; 32]).unwrap(), bound);
     }
 
     /// Split view: corrupted thread 2 has thread 0 sign `M1` and thread 1 sign `M2` at the
